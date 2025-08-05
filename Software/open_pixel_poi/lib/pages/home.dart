@@ -250,6 +250,7 @@ class _MyHomePageState extends State<MyHomePage> {
               fontWeight: FontWeight.bold,
              ),
             ),
+           ),
           subtitle: Column(
             children: [
               Row(
@@ -385,6 +386,7 @@ class _MyHomePageState extends State<MyHomePage> {
                   fontWeight: FontWeight.bold,
                  ),
                 ),
+               ),
               subtitle: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
