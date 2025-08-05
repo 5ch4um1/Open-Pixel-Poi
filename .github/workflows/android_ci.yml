@@ -39,7 +39,7 @@ jobs:
         with:
           # You can specify the Flutter version and channel here.
           # 'stable' is the recommended channel.
-          flutter-version: '3.22.0'
+          flutter-version: '3.32.8'
           channel: 'stable'
           
       # Step 4: Get all the project dependencies.
