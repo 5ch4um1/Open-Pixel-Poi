@@ -35,14 +35,27 @@ class _MyHomePageState extends State<MyHomePage> {
               .entries
               .map((entry) {
             int index = entry.key;
+            bool isSelected = _selectedPois.isEmpty || _selectedPois.contains(index);
             return InkWell(
               onTap: () {
                 setState(() {
-                  if (_selectedPois.contains(index)) {
-                    _selectedPois.remove(index);
+                  if (isSelected) {
+                    // If all are selected and we tap one, we deselect it and select all others
+                    if (_selectedPois.isEmpty) {
+                      for (int i = 0;
+                          i < Provider.of<Model>(context, listen: false).connectedPoi!.length;
+                          i++) {
+                        if (i != index) {
+                          _selectedPois.add(i);
+                        }
+                      }
+                    } else {
+                      _selectedPois.remove(index);
+                    }
                   } else {
                     _selectedPois.add(index);
                   }
+                  // If all are now selected, clear the set to indicate "all"
                   if (_selectedPois.length ==
                       Provider.of<Model>(context, listen: false)
                           .connectedPoi!
@@ -51,9 +64,17 @@ class _MyHomePageState extends State<MyHomePage> {
                   }
                 });
               },
-              child: ConnectionStateIndicator(
-                index,
-                isSelected: _selectedPois.isEmpty || _selectedPois.contains(index),
+              child: Container(
+                decoration: BoxDecoration(
+                  border: isSelected
+                      ? Border.all(color: Colors.amber, width: 2) // Highlight selected device
+                      : null,
+                  borderRadius: BorderRadius.circular(8.0),
+                ),
+                padding: const EdgeInsets.symmetric(horizontal: 4.0),
+                child: ConnectionStateIndicator(
+                  index,
+                ),
               ),
             );
           }),
@@ -64,6 +85,14 @@ class _MyHomePageState extends State<MyHomePage> {
           getButtons(context),
           getLoading(context),
         ],
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () {
+          setState(() {
+            _selectedPois.clear();
+          });
+        },
+        child: const Icon(Icons.select_all),
       ),
     );
   }
