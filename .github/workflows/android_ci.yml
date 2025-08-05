@@ -1,0 +1,69 @@
+# This is the name of your workflow, which will appear on the GitHub Actions page.
+name: Flutter Android CI
+
+# This defines when the workflow should run.
+# It will run on every push to the 'main' branch and for every pull request opened.
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# A workflow run is made up of one or more jobs.
+jobs:
+  # This is the name of our single job.
+  build_android:
+    # This specifies the type of machine to run the job on.
+    # We'll use a virtual machine running the latest version of Ubuntu.
+    runs-on: ubuntu-latest
+
+    # This defines the steps (the individual instructions) for the job.
+    steps:
+      # Step 1: Check out the repository.
+      # This action gets your repository code so the workflow can work with it.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2: Set up the Java Development Kit (JDK).
+      # The Android build process requires a specific version of Java.
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      # Step 3: Set up the Flutter SDK.
+      # This action automatically downloads and sets up Flutter.
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # You can specify the Flutter version and channel here.
+          # 'stable' is the recommended channel.
+          flutter-version: '3.22.0'
+          channel: 'stable'
+          
+      # Step 4: Get all the project dependencies.
+      # This is the equivalent of running 'flutter pub get' locally.
+      - name: Install dependencies
+        run: flutter pub get
+
+      # Step 5: Run the tests.
+      # This executes all the tests in your project. If any test fails, the workflow stops here.
+      - name: Run tests
+        run: flutter test
+
+      # Step 6: Build the Android APK.
+      # This command builds a release version of your APK. The output is placed in a specific directory.
+      - name: Build APK
+        run: flutter build apk --nocodesign
+
+      # Step 7: Upload the generated APK as an artifact.
+      # This action takes the APK created in the previous step and makes it available for download.
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # This is the name of the artifact, which you'll see in the UI.
+          name: android-apk
+          # This is the path to the file you want to upload. This is the default output path for a release APK.
+          path: build/app/outputs/flutter-apk/app-release.apk
+
