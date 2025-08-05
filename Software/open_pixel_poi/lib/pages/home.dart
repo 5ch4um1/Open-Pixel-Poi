@@ -20,38 +20,43 @@ class MyHomePage extends StatefulWidget {
 class _MyHomePageState extends State<MyHomePage> {
   final ValueNotifier<bool> loading = ValueNotifier<bool>(false);
   int tabIndex = 0;
-  int _selectedPoiIndex = 0; // New variable to track the selected device
   final ScrollController _scrollController = ScrollController();
+  final Set<int> _selectedPois = {};
 
   @override
   Widget build(BuildContext context) {
-    final model = Provider.of<Model>(context);
     return Scaffold(
       appBar: AppBar(
         title: const Text("Open Pixel Poi"),
         actions: [
-          // Dropdown to select a specific device
-          if (model.connectedPoi!.length > 1)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16.0),
-              child: DropdownButton<int>(
-                value: _selectedPoiIndex,
-                items: List.generate(
-                  model.connectedPoi!.length,
-                  (index) => DropdownMenuItem(
-                    value: index,
-                    child: Text('Device ${index + 1}'),
-                  ),
-                ),
-                onChanged: (int? newValue) {
-                  setState(() {
-                    _selectedPoiIndex = newValue!;
-                  });
-                },
+          ...Provider.of<Model>(context)
+              .connectedPoi!
+              .asMap()
+              .entries
+              .map((entry) {
+            int index = entry.key;
+            return InkWell(
+              onTap: () {
+                setState(() {
+                  if (_selectedPois.contains(index)) {
+                    _selectedPois.remove(index);
+                  } else {
+                    _selectedPois.add(index);
+                  }
+                  if (_selectedPois.length ==
+                      Provider.of<Model>(context, listen: false)
+                          .connectedPoi!
+                          .length) {
+                    _selectedPois.clear();
+                  }
+                });
+              },
+              child: ConnectionStateIndicator(
+                index,
+                isSelected: _selectedPois.isEmpty || _selectedPois.contains(index),
               ),
-            ),
-          ...model.connectedPoi!
-            .map((e) => ConnectionStateIndicator(model.connectedPoi!.indexOf(e)))
+            );
+          }),
         ],
       ),
       body: Stack(
@@ -166,12 +171,10 @@ class _MyHomePageState extends State<MyHomePage> {
         padding: const EdgeInsets.only(top: 8.0),
         child: ListTile(
           title: const Text("Brightness Level",
-            style: TextStyle(
-              color: Colors.blue,
-              fontSize: 24,
-              fontWeight: FontWeight.bold,
-             ),
-            ),
+              style: TextStyle(
+                  color: Colors.blue,
+                  fontSize: 24,
+                  fontWeight: FontWeight.bold)),
           subtitle: Column(
             children: [
               Row(
@@ -179,26 +182,26 @@ class _MyHomePageState extends State<MyHomePage> {
                 children: [
                   ElevatedButton(
                     child: const Text("1",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(1, CommCode.CC_SET_BRIGHTNESS, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(1, CommCode.CC_SET_BRIGHTNESS, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("2",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(4, CommCode.CC_SET_BRIGHTNESS, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(4, CommCode.CC_SET_BRIGHTNESS, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("3",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(10, CommCode.CC_SET_BRIGHTNESS, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(10, CommCode.CC_SET_BRIGHTNESS, false)),
                   ),
                 ],
               ),
@@ -207,26 +210,26 @@ class _MyHomePageState extends State<MyHomePage> {
                 children: [
                   ElevatedButton(
                     child: const Text("4",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(25, CommCode.CC_SET_BRIGHTNESS, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(25, CommCode.CC_SET_BRIGHTNESS, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("5",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(50, CommCode.CC_SET_BRIGHTNESS, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(50, CommCode.CC_SET_BRIGHTNESS, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("6",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(100, CommCode.CC_SET_BRIGHTNESS, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(100, CommCode.CC_SET_BRIGHTNESS, false)),
                   ),
                 ],
               ),
@@ -244,13 +247,10 @@ class _MyHomePageState extends State<MyHomePage> {
         padding: const EdgeInsets.only(top: 8.0),
         child: ListTile(
           title: const Text("Frames Per Second",
-            style: TextStyle(
-              color: Colors.blue,
-              fontSize: 24,
-              fontWeight: FontWeight.bold,
-             ),
-            ),
-           ),
+              style: TextStyle(
+                  color: Colors.blue,
+                  fontSize: 24,
+                  fontWeight: FontWeight.bold)),
           subtitle: Column(
             children: [
               Row(
@@ -258,26 +258,26 @@ class _MyHomePageState extends State<MyHomePage> {
                 children: [
                   ElevatedButton(
                     child: const Text("0",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(0, CommCode.CC_SET_SPEED, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(0, CommCode.CC_SET_SPEED, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("2",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(1, CommCode.CC_SET_SPEED, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(1, CommCode.CC_SET_SPEED, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("4",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(2, CommCode.CC_SET_SPEED, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(2, CommCode.CC_SET_SPEED, false)),
                   ),
                 ],
               ),
@@ -286,26 +286,26 @@ class _MyHomePageState extends State<MyHomePage> {
                 children: [
                   ElevatedButton(
                     child: const Text("10",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(5, CommCode.CC_SET_SPEED, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(5, CommCode.CC_SET_SPEED, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("20",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(10, CommCode.CC_SET_SPEED, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(10, CommCode.CC_SET_SPEED, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("40",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(20, CommCode.CC_SET_SPEED, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(20, CommCode.CC_SET_SPEED, false)),
                   ),
                 ],
               ),
@@ -314,26 +314,26 @@ class _MyHomePageState extends State<MyHomePage> {
                 children: [
                   ElevatedButton(
                     child: const Text("100",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(50, CommCode.CC_SET_SPEED, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(50, CommCode.CC_SET_SPEED, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("150",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(75, CommCode.CC_SET_SPEED, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(75, CommCode.CC_SET_SPEED, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("200",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(100, CommCode.CC_SET_SPEED, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(100, CommCode.CC_SET_SPEED, false)),
                   ),
                 ],
               ),
@@ -342,32 +342,33 @@ class _MyHomePageState extends State<MyHomePage> {
                 children: [
                   ElevatedButton(
                     child: const Text("300",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(150, CommCode.CC_SET_SPEED, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(150, CommCode.CC_SET_SPEED, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("400",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(200, CommCode.CC_SET_SPEED, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(200, CommCode.CC_SET_SPEED, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("500",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(250, CommCode.CC_SET_SPEED, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(250, CommCode.CC_SET_SPEED, false)),
                   ),
                 ],
               ),
             ],
           ),
         ),
+      ),
     );
   }
 
@@ -380,57 +381,53 @@ class _MyHomePageState extends State<MyHomePage> {
           children: [
             ListTile(
               title: const Text("Pattern Bank",
-                style: TextStyle(
-                  color: Colors.blue,
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                 ),
-                ),
-               ),
+                  style: TextStyle(
+                      color: Colors.blue,
+                      fontSize: 24,
+                      fontWeight: FontWeight.bold)),
               subtitle: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   ElevatedButton(
                     child: const Text("1",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(0, CommCode.CC_SET_BANK, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(0, CommCode.CC_SET_BANK, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("2",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(1, CommCode.CC_SET_BANK, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(1, CommCode.CC_SET_BANK, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("3",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendInt8(2, CommCode.CC_SET_BANK, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendInt8(2, CommCode.CC_SET_BANK, false)),
                   ),
                   const VerticalDivider(width: 8.0),
                   ElevatedButton(
                     child: const Text("∞",
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                    onPressed: () => Provider.of<Model>(context, listen: false)
-                        .connectedPoi![_selectedPoiIndex]
-                        .sendCommCode(CommCode.CC_SET_BANK_ALL, false),
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold)),
+                    onPressed: () => _sendToSelectedPois(
+                        (poi) => poi.sendCommCode(CommCode.CC_SET_BANK_ALL, false)),
                   ),
                 ],
               ),
             ),
             ListTile(
               title: const Text("Pattern Slot",
-                style: TextStyle(
-                  color: Colors.blue,
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                )),
+                  style: TextStyle(
+                      color: Colors.blue,
+                      fontSize: 24,
+                      fontWeight: FontWeight.bold)),
               subtitle: Column(
                 children: [
                   Row(
@@ -438,26 +435,26 @@ class _MyHomePageState extends State<MyHomePage> {
                     children: [
                       ElevatedButton(
                         child: const Text("1",
-                            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                        onPressed: () => Provider.of<Model>(context, listen: false)
-                            .connectedPoi![_selectedPoiIndex]
-                            .sendInt8(0, CommCode.CC_SET_PATTERN_SLOT, false),
+                            style: TextStyle(
+                                fontSize: 24, fontWeight: FontWeight.bold)),
+                        onPressed: () => _sendToSelectedPois((poi) =>
+                            poi.sendInt8(0, CommCode.CC_SET_PATTERN_SLOT, false)),
                       ),
                       const VerticalDivider(width: 8.0),
                       ElevatedButton(
                         child: const Text("2",
-                            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                        onPressed: () => Provider.of<Model>(context, listen: false)
-                            .connectedPoi![_selectedPoiIndex]
-                            .sendInt8(1, CommCode.CC_SET_PATTERN_SLOT, false),
+                            style: TextStyle(
+                                fontSize: 24, fontWeight: FontWeight.bold)),
+                        onPressed: () => _sendToSelectedPois((poi) =>
+                            poi.sendInt8(1, CommCode.CC_SET_PATTERN_SLOT, false)),
                       ),
                       const VerticalDivider(width: 8.0),
                       ElevatedButton(
                         child: const Text("3",
-                            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                        onPressed: () => Provider.of<Model>(context, listen: false)
-                            .connectedPoi![_selectedPoiIndex]
-                            .sendInt8(2, CommCode.CC_SET_PATTERN_SLOT, false),
+                            style: TextStyle(
+                                fontSize: 24, fontWeight: FontWeight.bold)),
+                        onPressed: () => _sendToSelectedPois((poi) =>
+                            poi.sendInt8(2, CommCode.CC_SET_PATTERN_SLOT, false)),
                       ),
                     ],
                   ),
@@ -466,26 +463,26 @@ class _MyHomePageState extends State<MyHomePage> {
                     children: [
                       ElevatedButton(
                         child: const Text("4",
-                            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                        onPressed: () => Provider.of<Model>(context, listen: false)
-                            .connectedPoi![_selectedPoiIndex]
-                            .sendInt8(3, CommCode.CC_SET_PATTERN_SLOT, false),
+                            style: TextStyle(
+                                fontSize: 24, fontWeight: FontWeight.bold)),
+                        onPressed: () => _sendToSelectedPois((poi) =>
+                            poi.sendInt8(3, CommCode.CC_SET_PATTERN_SLOT, false)),
                       ),
                       const VerticalDivider(width: 8.0),
                       ElevatedButton(
                         child: const Text("5",
-                            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                        onPressed: () => Provider.of<Model>(context, listen: false)
-                            .connectedPoi![_selectedPoiIndex]
-                            .sendInt8(4, CommCode.CC_SET_PATTERN_SLOT, false),
+                            style: TextStyle(
+                                fontSize: 24, fontWeight: FontWeight.bold)),
+                        onPressed: () => _sendToSelectedPois((poi) =>
+                            poi.sendInt8(4, CommCode.CC_SET_PATTERN_SLOT, false)),
                       ),
                       const VerticalDivider(width: 8.0),
                       ElevatedButton(
                         child: const Text("∞",
-                            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-                        onPressed: () => Provider.of<Model>(context, listen: false)
-                            .connectedPoi![_selectedPoiIndex]
-                            .sendCommCode(CommCode.CC_SET_PATTERN_ALL, false),
+                            style: TextStyle(
+                                fontSize: 24, fontWeight: FontWeight.bold)),
+                        onPressed: () => _sendToSelectedPois((poi) =>
+                            poi.sendCommCode(CommCode.CC_SET_PATTERN_ALL, false)),
                       ),
                     ],
                   ),
@@ -553,21 +550,8 @@ class _MyHomePageState extends State<MyHomePage> {
                       setState(() {
                         loading.value = true;
                       });
-                      final poi =
-                        Provider.of<Model>(context, listen: false).connectedPoi![_selectedPoiIndex];
-                      if (poi.isConncted) {
-                        if (!kIsWeb) {
-                          // Calling connect seems to bring device to the front of a magic queue and operate faster, and properly
-                          await poi.uart.device
-                              .connect(timeout: const Duration(seconds: 5), autoConnect: false)
-                              .timeout(const Duration(milliseconds: 5250));
-                          await poi.uart.device.clearGattCache(); // Boosts speed too
-                        }
-                        await poi.sendPattern2(tuple.item2)
-                            .timeout(const Duration(seconds: 5), onTimeout: () {
-                          return false;
-                        });
-                      }
+                      await _sendToSelectedPoisAsync(
+                          (poi) async => await poi.sendPattern2(tuple.item2));
                       setState(() {
                         loading.value = false;
                       });
@@ -577,7 +561,7 @@ class _MyHomePageState extends State<MyHomePage> {
                       builder: (BuildContext context) => AlertDialog(
                         title: const Text("Edit/Delete Pattern"),
                         content: Text(
-                          'Image Stats:\nwidth=${tuple.item2.count}\nheight=${tuple.item2.height}'),
+                            'Image Stats:\nwidth=${tuple.item2.count}\nheight=${tuple.item2.height}'),
                         actionsPadding: const EdgeInsets.all(0.0),
                         actions: <Widget>[
                           TextButton(
@@ -682,6 +666,7 @@ class _MyHomePageState extends State<MyHomePage> {
             );
           },
         ),
+      ),
     );
   }
 
@@ -689,17 +674,59 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       // tabIndex = 0; // This doesn't properly select the tab
     });
-    // This is probably the most gross thing ive ever done, and im sorry 😭 (also the animation doesn't work) don't be sorry.
+    // This is probably the most gross thing ive ever done, and im sorry 😭 (also the animation doesn't work)
     WidgetsBinding.instance.addPostFrameCallback((_) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           _scrollController.animateTo(
             _scrollController.position.maxScrollExtent, // Scroll to the bottom
-            duration: const Duration(milliseconds: 500), // Duration of the animation
+            duration: Duration(milliseconds: 500), // Duration of the animation
             curve: Curves.easeOut, // Smooth easing curve
           );
         });
       });
     });
+  }
+
+  void _sendToSelectedPois(void Function(dynamic) sendFunction) {
+    final model = Provider.of<Model>(context, listen: false);
+    if (_selectedPois.isEmpty) {
+      model.connectedPoi!.forEach(sendFunction);
+    } else {
+      for (var index in _selectedPois) {
+        if (index < model.connectedPoi!.length) {
+          sendFunction(model.connectedPoi![index]);
+        }
+      }
+    }
+  }
+
+  Future<void> _sendToSelectedPoisAsync(
+      Future<bool> Function(dynamic) sendFunction) async {
+    final model = Provider.of<Model>(context, listen: false);
+    if (_selectedPois.isEmpty) {
+      for (var poi in model.connectedPoi!) {
+        if (!kIsWeb) {
+          await poi.uart.device
+              .connect(timeout: Duration(seconds: 5), autoConnect: false)
+              .timeout(Duration(milliseconds: 5250));
+          await poi.uart.device.clearGattCache();
+        }
+        await sendFunction(poi).timeout(const Duration(seconds: 5));
+      }
+    } else {
+      for (var index in _selectedPois) {
+        if (index < model.connectedPoi!.length) {
+          final poi = model.connectedPoi![index];
+          if (!kIsWeb) {
+            await poi.uart.device
+                .connect(timeout: Duration(seconds: 5), autoConnect: false)
+                .timeout(Duration(milliseconds: 5250));
+            await poi.uart.device.clearGattCache();
+          }
+          await sendFunction(poi).timeout(const Duration(seconds: 5));
+        }
+      }
+    }
   }
 }
