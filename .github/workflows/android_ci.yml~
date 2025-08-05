@@ -5,9 +5,9 @@ name: Flutter Android CI
 # It will run on every push to the 'main' branch and for every pull request opened.
 on:
   push:
-    branches: [ ci ]
+    branches: [ main ]
   pull_request:
-    branches: [ ci ]
+    branches: [ main ]
 
 # A workflow run is made up of one or more jobs.
 jobs:
