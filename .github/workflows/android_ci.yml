@@ -57,7 +57,7 @@ jobs:
       # Step 6: Build the Android APK.
       # This command builds a release version of your APK. The output is placed in a specific directory.
       - name: Build APK
-        run: flutter build apk --nocodesign
+        run: flutter build apk --release
         working-directory: 'Software/open_pixel_poi'
 
       # Step 7: Upload the generated APK as an artifact.
