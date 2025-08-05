@@ -51,16 +51,12 @@ public:
   OpenPixelPoiButton(OpenPixelPoiConfig& _config): config(_config) {}    
 
   void setup() {
-    // Voltage Input
-    pinMode(A0, INPUT);
+ 
 
     //Button Input
     pinMode(3,INPUT_PULLUP);
 
-    // Regulator Output
-    pinMode(D7, OUTPUT);
-    regulatorEnabled = true;
-    digitalWrite(D7, HIGH);
+
 
   }
 
@@ -242,30 +238,6 @@ public:
 
     // Read battery voltage
     config.batteryVoltage = (config.batteryVoltage * 0.999) + ((analogReadMilliVolts(A0)/500.0) * .001);
-
-    // Super low voltage, emergency shutdown (uses data from previous read, this is ok). 
-    if (config.batteryState == BAT_SHUTDOWN && config.displayState != DS_SHUTDOWN){
-      config.displayState = DS_SHUTDOWN;
-      config.displayStateLastUpdated = millis();
-      shutDownAt = millis();
-    }
-
-    // do a shutdown if flaged
-    if(shutDownAt != 0 && millis() - shutDownAt > 2000){
-      // Regulator Shutdown
-      digitalWrite(D7, LOW);
-      delay(500);
-      
-      //hold disable, isolate and power domain config functions may be unnecessary
-      //gpio_deep_sleep_hold_dis();
-      //esp_sleep_config_gpio_isolate();
-      //esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
-
-      // ESP32 Shutdown sequence
-      gpio_set_direction(gpio_num_t(3), GPIO_MODE_INPUT);
-      esp_deep_sleep_enable_gpio_wakeup(0b001000, ESP_GPIO_WAKEUP_GPIO_LOW);
-      esp_deep_sleep_start();
-    }
 
   }
 

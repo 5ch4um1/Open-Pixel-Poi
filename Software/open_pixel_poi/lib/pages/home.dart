@@ -39,32 +39,38 @@ class _MyHomePageState extends State<MyHomePage> {
             return InkWell(
               onTap: () {
                 setState(() {
-                  if (isSelected) {
-                    // If all are selected and we tap one, we deselect it and select all others
-                    if (_selectedPois.isEmpty) {
-                      for (int i = 0;
-                          i < Provider.of<Model>(context, listen: false).connectedPoi!.length;
-                          i++) {
-                        if (i != index) {
-                          _selectedPois.add(i);
-                        }
+                  // Check if we are in the "all selected" state, which is an empty set
+                  bool isAllSelected = _selectedPois.isEmpty;
+
+                  if (isAllSelected) {
+                    // Tapping on any device when all are selected
+                    // should deselect all others and select only this one.
+                    // To do this, we add all indices except the tapped one.
+                    for (int i = 0; i < Provider.of<Model>(context, listen: false).connectedPoi!.length; i++) {
+                      if (i != index) {
+                        _selectedPois.add(i);
                       }
-                    } else {
-                      _selectedPois.remove(index);
                     }
                   } else {
-                    _selectedPois.add(index);
+                    // We have some individual devices selected.
+                    // Tapping on a selected device should deselect it.
+                    // Tapping on an unselected device should select it.
+                    if (_selectedPois.contains(index)) {
+                      _selectedPois.remove(index);
+                    } else {
+                      _selectedPois.add(index);
+                    }
                   }
-                  // If all are now selected, clear the set to indicate "all"
-                  if (_selectedPois.length ==
-                      Provider.of<Model>(context, listen: false)
-                          .connectedPoi!
-                          .length) {
+                  
+                  // After any change, if the number of selected devices equals the total,
+                  // we clear the set to return to the "all selected" state.
+                  if (_selectedPois.length == Provider.of<Model>(context, listen: false).connectedPoi!.length) {
                     _selectedPois.clear();
                   }
                 });
               },
               child: Container(
+                key: ValueKey('poi_$index'), // Added a unique key
                 decoration: BoxDecoration(
                   border: isSelected
                       ? Border.all(color: Colors.amber, width: 2) // Highlight selected device

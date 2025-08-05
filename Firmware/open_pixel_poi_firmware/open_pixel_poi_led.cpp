@@ -24,7 +24,7 @@ class OpenPixelPoiLED {
     long lastFrameIndex = 0;
 
     // Declare our NeoPixel strip object:
-    Adafruit_NeoPixel led_strip{20, D8, NEO_GRB + NEO_KHZ800};
+    Adafruit_NeoPixel led_strip{20, 3, NEO_GRB + NEO_KHZ800};
     
   public:
     OpenPixelPoiLED(OpenPixelPoiConfig& _config): config(_config) {}    
