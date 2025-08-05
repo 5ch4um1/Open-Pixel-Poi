@@ -2,7 +2,7 @@
 name: Flutter Android CI
 
 # This defines when the workflow should run.
-# It will run on every push to the 'main' branch and for every pull request opened.
+# It will run on every push to the 'ci' branch and for every pull request opened.
 on:
   push:
     branches: [ ci ]
@@ -39,10 +39,8 @@ jobs:
         with:
           # You can specify the Flutter version and channel here.
           # 'stable' is the recommended channel.
-          flutter-version: '3.22.0'
+          flutter-version: '3.7.2'
           channel: 'stable'
-          # Add the working-directory to tell Flutter where the project lives
-          working-directory: 'Software/open_pixel_poi'
           
       # Step 4: Get all the project dependencies.
       # This is the equivalent of running 'flutter pub get' locally.
@@ -71,4 +69,3 @@ jobs:
           name: android-apk
           # The path now includes the subdirectory.
           path: Software/open_pixel_poi/build/app/outputs/flutter-apk/app-release.apk
-
