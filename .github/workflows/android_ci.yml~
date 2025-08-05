@@ -39,7 +39,7 @@ jobs:
         with:
           # You can specify the Flutter version and channel here.
           # 'stable' is the recommended channel.
-          flutter-version: '3.7.2'
+          flutter-version: '3.22.0'
           channel: 'stable'
           # Add the working-directory to tell Flutter where the project lives
           working-directory: 'Software/open_pixel_poi'
