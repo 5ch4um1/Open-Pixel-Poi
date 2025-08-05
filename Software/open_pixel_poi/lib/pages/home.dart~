@@ -684,7 +684,7 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       // tabIndex = 0; // This doesn't properly select the tab
     });
-    // This is probably the most gross thing ive ever done, and im sorry 😭 (also the animation doesn't work) don't be sorry.
+    // This is probably the most gross thing ive ever done, and im sorry 😭 (also the animation doesn't work)
     WidgetsBinding.instance.addPostFrameCallback((_) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
