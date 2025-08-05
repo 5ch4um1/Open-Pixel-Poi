@@ -170,7 +170,8 @@ class _MyHomePageState extends State<MyHomePage> {
               color: Colors.blue,
               fontSize: 24,
               fontWeight: FontWeight.bold,
-            )),
+             ),
+            ),
           subtitle: Column(
             children: [
               Row(
@@ -247,7 +248,8 @@ class _MyHomePageState extends State<MyHomePage> {
               color: Colors.blue,
               fontSize: 24,
               fontWeight: FontWeight.bold,
-            )),
+             ),
+            ),
           subtitle: Column(
             children: [
               Row(
@@ -381,7 +383,8 @@ class _MyHomePageState extends State<MyHomePage> {
                   color: Colors.blue,
                   fontSize: 24,
                   fontWeight: FontWeight.bold,
-                )),
+                 ),
+                ),
               subtitle: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
