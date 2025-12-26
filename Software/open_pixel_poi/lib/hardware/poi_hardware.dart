@@ -46,7 +46,7 @@ class PoiHardware {
     while (request.isNotEmpty) {
       try {
         List<int> packet = request.take(maxPacketsize).toList();
-        await uart.write(packet, withoutResponse: true);
+        await uart.write(packet, withoutResponse: false);
 
         sentPackets++;
         sentSize += packet.length;
