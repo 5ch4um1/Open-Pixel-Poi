@@ -6,7 +6,6 @@
 #include <math.h>
 #include <errno.h>
 #include <dirent.h>
-#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -83,9 +82,9 @@ volatile TickType_t g_last_press_tick = 0; // Added this
 
 static void IRAM_ATTR button_isr_handler(void* arg) {
     bool current_level = gpio_get_level(BOOT_BUTTON_PIN);
-    g_btn_is_down = !current_level; 
+    g_btn_is_down = !current_level;
     g_btn_transition_tick = xTaskGetTickCountFromISR();
-    
+
     if (g_btn_is_down) {
         g_last_press_tick = g_btn_transition_tick;
     }
@@ -100,28 +99,219 @@ void run_flash_animation(uint32_t color);
 // --- Hardware ---
 #define LED_GPIO            GPIO_NUM_4
 #define BUTTON_GPIO         GPIO_NUM_9
-#define REGULATOR_GPIO      GPIO_NUM_7 
+#define REGULATOR_GPIO      GPIO_NUM_20
 #define MAX_LEDS            20
 
 //LEDs stuff
-#define READ_BUFFER_SIZE 1024 
+#define READ_BUFFER_SIZE 1024
  uint32_t frame_counter = 0;
 volatile bool led_task_running = true;
 volatile bool led_task_paused = false; // To tell us it's safely stopped
 
 #define BYTES_PER_FRAME (MAX_LEDS * 3)
-#define FRAME_COUNT 42 
+#define FRAME_COUNT 42
 #define RING_BUF_SIZE (BYTES_PER_FRAME * FRAME_COUNT)
 
 //streaming
-uint8_t g_ring_buffer[RING_BUF_SIZE];
-uint16_t g_write_idx = 0; // Where BLE writes
-uint16_t g_read_idx = 0;  // Where the LED task reads
+bool g_request_blackout_val = false;
+// Sub-frame field offsets (relative to asm_buf[0] == 0xD0)
+#define OFF_TYPE        1   // 0x0D
+#define OFF_VER         2
+#define OFF_LED_H       3
+#define OFF_LED_W       4
+#define OFF_PAYLEN_H    5
+#define OFF_PAYLEN_L    6
+#define OFF_SEQ_H       7
+#define OFF_SEQ_L       8
+#define OFF_CRC32       9   // 9..12 (big-endian)
+#define OFF_PAYLOAD     13  // start of payload
+
+static int find_subframe_start(const uint8_t *d, int n) {
+    // Look for 0xD0 0x0D anywhere in this chunk
+    for (int i = 0; i + 1 < n; i++) {
+        if (d[i] == 0xD0 && d[i+1] == 0x0D) return i;
+    }
+    return -1;
+}
+
+//streaming packet format
+static struct {
+    uint16_t led_h;       // negotiated frame height (<= MAX_LEDS)
+    uint16_t payload_len; // led_h * 3
+    uint16_t mtu;         // current GATT MTU (optional)
+    uint16_t last_seq;    // last accepted frame sequence
+    bool     active;
+} g_stream_cfg = {
+    .led_h = MAX_LEDS,
+    .payload_len = MAX_LEDS * 3,
+    .mtu = 0,
+    .last_seq = 0,
+    .active = false,
+};
+
+
 bool g_is_streaming = false;
 uint64_t g_last_stream_time = 0;
 bool g_is_refreshing = false;
-static uint8_t g_assembly_buf[425]; // Header(1) + CMD(1) + Len(2) + Payload(420) + Footer(1)
-static uint16_t g_assembly_pos = 0;
+
+
+//streaming buffer
+
+#define STREAM_MAX_H      144            // upper bound (protect heap)
+#define STREAM_MAX_PAYLOAD (STREAM_MAX_H * 3)
+#define STREAM_MAX_FRAME   (32 /*hdr*/ + STREAM_MAX_PAYLOAD + 1 /*footer*/)
+
+typedef enum { ASM_IDLE, ASM_HEADER, ASM_PAYLOAD, ASM_FOOTER } asm_state_t;
+
+static asm_state_t asm_state = ASM_IDLE;
+static uint8_t     asm_buf[STREAM_MAX_FRAME];
+static uint16_t    asm_pos = 0;
+static uint16_t    asm_expected = 0;     // total frame size we expect
+static uint16_t    asm_payload_len = 0;
+static uint16_t    asm_seq = 0;
+
+static void asm_reset(void) {
+    asm_state = ASM_IDLE;
+    asm_pos = 0;
+    asm_expected = 0;
+    asm_payload_len = 0;
+    asm_seq = 0;
+}
+//streaming ringbuffer
+// sizes driven by negotiated payload_len (g_stream_cfg.payload_len)
+#define FRAME_COUNT        42
+static uint8_t  g_ring_buffer[STREAM_MAX_PAYLOAD * FRAME_COUNT];
+static uint32_t g_write_idx = 0;
+static uint32_t g_read_idx  = 0;
+
+// push one assembled frame payload into ring
+static void push_frame_to_ring(const uint8_t *payload, uint16_t len, uint16_t seq) {
+    // Drop duplicates/out-of-order
+    if ((uint16_t)(seq - g_stream_cfg.last_seq) == 0) return;  // duplicate
+    g_stream_cfg.last_seq = seq;
+
+    // If len != current payload_len (sender changed height), adapt on the fly
+    g_stream_cfg.payload_len = len;
+
+    // Wrap-safe copy
+    uint32_t cap = STREAM_MAX_PAYLOAD * FRAME_COUNT;
+    uint32_t end = g_write_idx + len;
+    if (end <= cap) {
+        memcpy(&g_ring_buffer[g_write_idx], payload, len);
+    } else {
+        uint32_t first = cap - g_write_idx;
+        memcpy(&g_ring_buffer[g_write_idx], payload, first);
+        memcpy(&g_ring_buffer[0],        payload + first, len - first);
+    }
+    g_write_idx = (g_write_idx + len) % cap;
+}
+
+
+
+static void asm_reset(void);            // your existing reset
+
+//static uint32_t crc32_ieee(const uint8_t *data, size_t len); // if you enabled CRC
+
+static bool asm_feed(const uint8_t *frag, uint16_t frag_len)
+{
+    // Cap to buffer to avoid overflow
+    if (frag_len > (STREAM_MAX_FRAME - asm_pos)) {
+        frag_len = STREAM_MAX_FRAME - asm_pos;
+    }
+    if (frag_len > 0) {
+        memcpy(&asm_buf[asm_pos], frag, frag_len);
+        asm_pos += frag_len;
+    }
+
+    // --- STATE: sync on sub-frame start D0 0D ---
+    if (asm_state == ASM_IDLE) {
+        if (asm_pos < 2) return false; // need at least D0 0D candidates
+
+        // Find the first occurrence of D0 0D in the accumulated buffer
+        int s = -1;
+        for (int i = 0; i + 1 < asm_pos; ++i) {
+            if (asm_buf[i] == 0xD0 && asm_buf[i + 1] == 0x0D) { s = i; break; }
+        }
+        if (s < 0) {
+            // Keep one byte to help find D0 on next feed
+            asm_buf[0] = asm_buf[asm_pos - 1];
+            asm_pos = 1;
+            return false;
+        }
+        // Shift so sub-frame begins at asm_buf[0]
+        if (s > 0) {
+            memmove(asm_buf, &asm_buf[s], asm_pos - s);
+            asm_pos -= s;
+        }
+        asm_state = ASM_HEADER;
+    }
+
+    // --- STATE: header parsing ---
+    if (asm_state == ASM_HEADER) {
+        // Need the full fixed header: D0 + Type..Seq + CRC32 (13 bytes total)
+        if (asm_pos < OFF_PAYLOAD) return false;
+
+        uint8_t  ver         = asm_buf[OFF_VER];
+        uint8_t  led_h       = asm_buf[OFF_LED_H];
+        uint16_t payload_len = ((uint16_t)asm_buf[OFF_PAYLEN_H] << 8) | asm_buf[OFF_PAYLEN_L];
+        asm_seq              = ((uint16_t)asm_buf[OFF_SEQ_H]    << 8) | asm_buf[OFF_SEQ_L];
+
+/*
+        // Big-endian CRC32 stored at OFF_CRC32, not checking for now
+        uint32_t crc_be = ((uint32_t)asm_buf[OFF_CRC32 + 0] << 24) |
+                          ((uint32_t)asm_buf[OFF_CRC32 + 1] << 16) |
+                          ((uint32_t)asm_buf[OFF_CRC32 + 2] <<  8) |
+                          (uint32_t)asm_buf[OFF_CRC32 + 3];
+*/
+
+        // Sanity checks
+        if (ver != 0x01) { asm_reset(); return false; }
+        if (led_h == 0 || led_h > STREAM_MAX_H) { asm_reset(); return false; }
+        if (payload_len != (uint16_t)led_h * 3 || payload_len > STREAM_MAX_PAYLOAD) {
+            asm_reset(); return false;
+        }
+
+        asm_payload_len = payload_len;
+        // Expected bytes for the complete sub-frame = header (OFF_PAYLOAD) + payload + 1-byte footer
+        asm_expected    = OFF_PAYLOAD + asm_payload_len + 1;
+        asm_state       = ASM_PAYLOAD;
+    }
+
+    // --- STATE: accumulate payload (+footer) ---
+    if (asm_state == ASM_PAYLOAD) {
+        if (asm_pos < asm_expected) return false; // frame not complete yet
+
+        // Footer check: last byte of sub-frame must be 0xD1
+        if (asm_buf[asm_expected - 1] != 0xD1) {
+            asm_reset();
+            return false;
+        }
+
+        // Optional CRC32 verification over [Type..Seq] + payload
+        // Coverage length = (OFF_PAYLOAD - OFF_TYPE) header w/o CRC + payload_len
+        //   OFF_PAYLOAD - OFF_TYPE == 12 bytes (Type, Ver, H, W, LenH, LenL, SeqH, SeqL)
+        /*
+        size_t crc_region_len = (OFF_PAYLOAD - OFF_TYPE) + asm_payload_len;
+        uint32_t crc_calc = crc32_ieee(&asm_buf[OFF_TYPE], crc_region_len);
+        if (crc_calc != crc_be) {
+            asm_reset();
+            return false;
+        }
+        */
+
+        // Full frame ready
+        asm_state = ASM_FOOTER;
+    }
+
+    if (asm_state == ASM_FOOTER) {
+        return true;
+    }
+
+    return false;
+}
+
+
+
 
 //banks & slots
 volatile uint8_t g_current_bank = 1;
@@ -170,7 +360,7 @@ static uint8_t ble_resp_buf[20]; // Size it for your largest possible response
 static uint16_t ble_resp_len = 0;
 
 static const uint8_t resp_success[] = {0xD0, 0x00, 0x01}; // Standard Success
-static const uint8_t resp_error[]   = {0xD0, 0x01, 0x01}; // Standard Error 
+static const uint8_t resp_error[]   = {0xD0, 0x01, 0x01}; // Standard Error
 static const uint8_t resp_firmware[]= {0xD0, 0x00, 0x06, 0x09, 0x02, 0xD1};
 
 void set_ble_reply(const uint8_t *data, uint16_t len) {
@@ -189,7 +379,7 @@ uint8_t g_strip_height = 0;   // Extracted from the pattern data
 uint16_t g_pattern_width = 0; // Extracted from the pattern data
 
 
-
+/*
 // Janitor task
 void run_storage_janitor() {
     size_t total = 0, used = 0;
@@ -199,12 +389,12 @@ void run_storage_janitor() {
     // If more than 90% is used, start clearing
     if (used > (total * 0.9)) {
         ESP_LOGW("SPIFFS", "Storage near limit (%zu/%zu). Cleaning slots...", used, total);
-        
+
         // Delete slots 10 through 50 to make a big chunk of room
         for (int i = 50; i >= 10; i--) {
             char path[32];
             snprintf(path, sizeof(path), "/spiffs/p_%d.bin", i);
-            
+
             struct stat st;
             if (stat(path, &st) == 0) { // Check if file exists
                 unlink(path);
@@ -213,9 +403,10 @@ void run_storage_janitor() {
         }
     }
 }
+*/
 
 // LEDS POV
-uint8_t g_poi_speed = 128; // Default speed 
+uint8_t g_poi_speed = 128; // Default speed
 led_strip_handle_t led_strip;
 volatile bool g_reloading_pattern = false;
 
@@ -242,11 +433,11 @@ void run_upload_animation() {                         // --- MODE C: UPLOAD IN P
 
                                 // Fades out as it gets further from the head
 
-                                uint8_t br = 150 / (i + 1); 
+                                uint8_t br = 150 / (i + 1);
 
                                 // Bright Blue for the head, dimmer for the tail
 
-                                led_strip_set_pixel(led_strip, p, 0, br / 2, br); 
+                                led_strip_set_pixel(led_strip, p, 0, br / 2, br);
 
                             }
 
@@ -269,15 +460,14 @@ void run_upload_animation() {                         // --- MODE C: UPLOAD IN P
 
                         // Faster refresh for the animation, but still plenty of CPU for BLE
 
-                        vTaskDelay(pdMS_TO_TICKS(30)); 
+                        vTaskDelay(pdMS_TO_TICKS(30));
 
-                         
 
-                    } 
+                    }
 
 //default pattern
 void default_rainbow_pattern() {
-	for (int i = 0; i < 144; i++) {
+	for (int i = 0; i < MAX_LEDS; i++) {
 
                 uint8_t r = (uint8_t)(127 + 127 * sin((i + frame_counter) * 0.1));
 
@@ -285,7 +475,7 @@ void default_rainbow_pattern() {
 
                 uint8_t b = (uint8_t)(127 + 127 * sin((i + frame_counter) * 0.1 + 4));
 
-                
+
 
                 float scale = g_brightness / 255.0;
 
@@ -299,8 +489,8 @@ void default_rainbow_pattern() {
 
             vTaskDelay(pdMS_TO_TICKS(20));
 
-        }  
- 
+        }
+
  //flash animation
  void run_flash_animation(uint32_t color) {
     uint8_t r = (color >> 16) & 0xFF;
@@ -313,21 +503,28 @@ void default_rainbow_pattern() {
     led_strip_refresh(led_strip);
     // Note: We don't vTaskDelay here because we are inside the task loop
 }
-        
+//blackout all leds
+
+void g_request_blackout() {
+    for (int i = 0; i < MAX_LEDS; i++) { led_strip_set_pixel(led_strip, i, 0, 0, 0); }
+    led_strip_refresh(led_strip);
+    g_request_blackout_val = false;
+}
+
 // LEDS POV render task
 void pov_render_task(void *pvParameters) {
     // 1. Buffers: Use 'static' to keep them off the stack
-    static uint8_t read_buf[1024]; 
+    static uint8_t read_buf[1024];
     static FILE* f = NULL;
-    
+
     uint16_t buf_pos = 0;
     uint16_t bytes_in_buf = 0;
     uint8_t img_h = 0;
     uint16_t img_w = 0;
-   
+
 
     while (1) {
-//button 
+//button
 // Static variables to persist between loop iterations
 static int g_short_press_count = 0;
 static bool g_in_menu_mode = false;
@@ -342,11 +539,11 @@ if (g_btn_is_down) {
         g_in_menu_mode = true;
         g_short_press_count = 0;
         ESP_LOGI("BTN", "Menu Mode Active");
-        run_flash_animation(0xFFFFFF); 
+        run_flash_animation(0xFFFFFF);
     }
 } else {
     // 2. Detect Short Press on Release
-    if (g_btn_transition_tick > g_last_release_tick) { 
+    if (g_btn_transition_tick > g_last_release_tick) {
         TickType_t duration = g_btn_transition_tick - g_last_press_tick;
         // If it was a quick tap (50ms to 500ms)
         if (duration < pdMS_TO_TICKS(500) && duration > pdMS_TO_TICKS(50)) {
@@ -375,7 +572,7 @@ if (g_btn_is_down) {
 }
 
 //button end
-		
+
        //check if we should do anything at all
        if (!led_task_running) {
             led_task_paused = true;
@@ -383,9 +580,8 @@ if (g_btn_is_down) {
             vTaskDelay(pdMS_TO_TICKS(100)); // Sleep until upload finishes
             continue;
         }
-        
+
         led_task_paused = false;
-        // ... your existing pattern rendering code ...
         // Ensure there is a vTaskDelay() here so the WDT stays happy!
         vTaskDelay(pdMS_TO_TICKS(10));
         // --- UPLOAD GUARD ---
@@ -397,44 +593,70 @@ if (g_btn_is_down) {
             vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
-          
-          //streaming
-if (g_is_streaming) {
-            uint64_t now = esp_timer_get_time() / 1000;
 
-            if (now - g_last_stream_time > 2000) {
-                g_is_streaming = false;
-                ESP_LOGW("WATCHDOG", "Stream Timeout");
-            } 
-            else if (g_read_idx != g_write_idx) {
-                // If streaming, we close the file if it was open
-                if (f) { fclose(f); f = NULL; }
 
-                float scale = g_brightness / 255.0f;
+// --- streaming section start ---
+if (g_stream_cfg.active) {
+    uint64_t now = esp_timer_get_time() / 1000ULL;
 
-    for (int j = 0; j < MAX_LEDS; j++) {
-        int offset = g_read_idx + (j * 3);
-        
-        // Apply the scale to each color channel
-        uint8_t r = (uint8_t)(g_ring_buffer[offset] * scale);
-        uint8_t g = (uint8_t)(g_ring_buffer[offset + 1] * scale);
-        uint8_t b = (uint8_t)(g_ring_buffer[offset + 2] * scale);
-        
-        // Use your preferred inversion logic: MAX_LEDS - 1 - j
-        led_strip_set_pixel(led_strip, MAX_LEDS - 1 - j, r, g, b);
+    // Watchdog: stop streaming after 2s without incoming frames
+    if ((now - g_last_stream_time) > 2000ULL) {
+        g_stream_cfg.active = false;
+        ESP_LOGW("WATCHDOG", "Stream Timeout");
+        // Optional cleanup:
+        // g_read_idx = g_write_idx = 0;
+        // led_strip_clear(led_strip); led_strip_refresh(led_strip);
     }
-    
-    
-                led_strip_refresh(led_strip);
-                g_read_idx = (g_read_idx + BYTES_PER_FRAME) % RING_BUF_SIZE;
+    else if (g_read_idx != g_write_idx) {
+        // If you have a file/pattern fallback elsewhere, close it here. If not, you can remove this.
+        if (f) { fclose(f); f = NULL; }
+
+        uint16_t L      = g_stream_cfg.payload_len;   // bytes per frame
+        uint16_t led_h  = g_stream_cfg.led_h;         // logical LEDs (<= MAX_LEDS)
+        float    scale  = g_brightness / 255.0f;
+        uint32_t cap    = STREAM_MAX_PAYLOAD * FRAME_COUNT;
+        uint32_t base   = g_read_idx;
+
+        // Guard: payload must be sane and aligned
+        if (L == 0 || (L % 3) != 0 || L > STREAM_MAX_PAYLOAD) {
+            ESP_LOGW("STREAM", "Bad frame L=%u; skipping", L);
+            // Skip one frame's worth to resync
+            g_read_idx = (g_read_idx + (L ? L : 3)) % cap;
+        } else {
+            int logical_leds = (int)(L / 3);
+            if (led_h > 0 && led_h < logical_leds) logical_leds = led_h;
+            if (logical_leds > MAX_LEDS) logical_leds = MAX_LEDS;
+
+            for (int j = 0; j < logical_leds; j++) {
+                // Compute byte offset with wrap for R,G,B
+                uint32_t offR = (base + (uint32_t)j * 3U) % cap;
+                uint32_t offG = (offR + 1U) % cap;
+                uint32_t offB = (offR + 2U) % cap;
+
+                uint8_t r = (uint8_t)(g_ring_buffer[offR] * scale);
+                uint8_t g = (uint8_t)(g_ring_buffer[offG] * scale);
+                uint8_t b = (uint8_t)(g_ring_buffer[offB] * scale);
+
+                // Invert mapping across physical strip (mirror); change to `int phys = j;` if not desired
+                int phys = MAX_LEDS - 1 - j;
+                if ((unsigned)phys < MAX_LEDS) {
+                    led_strip_set_pixel(led_strip, phys, r, g, b);
+                }
             }
 
-            // IMPORTANT: Use a fixed high-speed delay for streaming
-            vTaskDelay(pdMS_TO_TICKS(5)); 
-            continue; // <--- THIS IS THE KEY: Skip all the file/pattern code below
+            led_strip_refresh(led_strip);
+            // Consume exactly one frame
+            g_read_idx = (g_read_idx + L) % cap;
         }
-    
-        
+    }
+
+    // Fixed high-speed delay for streaming
+    vTaskDelay(pdMS_TO_TICKS(5));
+    continue; // <-- Skip all file/pattern code below while streaming
+}
+// --- streaming section end ---
+
+
    		//check battery
 		static TickType_t last_battery_tick = 0;
          current_tick = xTaskGetTickCount();
@@ -442,31 +664,30 @@ if (g_is_streaming) {
 if ((current_tick - last_battery_tick) > pdMS_TO_TICKS(10000)){
     int adc_raw;
     if (adc_oneshot_read(adc1_handle, ADC_CHANNEL_0, &adc_raw) == ESP_OK) {
-        
+
         // Convert raw to voltage at the PIN (approx 0-3.1V)
         float pin_volt = (adc_raw * 3.1f) / 4095.0f;
-        
+
         // Account for the divider: V_bat = V_pin * (R1 + R2) / R2
         // For 100k and 47k: (147 / 47) = ~3.127
         g_battery_voltage = pin_volt * 3.127f;
 
         // Safety: If battery is too low (< 3.3V), maybe dim the LEDs?
         if (g_battery_voltage < 3.3f) {
-            
+
         }
     }
     last_battery_tick = current_tick;
-} 
+}
 
-					
 				// --- SHUFFLE TIMER CHECK ---
 				if (g_shuffle_slots_only || g_shuffle_all_banks) {
 					uint32_t now = xTaskGetTickCount();
 					if (pdTICKS_TO_MS(now - g_last_shuffle_tick) > g_shuffle_duration_ms) {
-						
+
 						if (g_shuffle_all_banks) {
 							// Pick a random bank (assuming 0-3) and random slot (0-7)
-							g_current_bank = esp_random() % 3; 
+							g_current_bank = esp_random() % 3;
 							g_current_slot = esp_random() % 4;
 						} else {
 							// Shuffle only slots in current bank
@@ -475,8 +696,8 @@ if ((current_tick - last_battery_tick) > pdMS_TO_TICKS(10000)){
 
 						g_reloading_pattern = true; // Trigger the file-opener logic
 						g_last_shuffle_tick = now;
-						
-					
+
+
 					}
 				}
 
@@ -500,7 +721,7 @@ if ((current_tick - last_battery_tick) > pdMS_TO_TICKS(10000)){
         }
 
         if (f == NULL) {
-            default_rainbow_pattern(&frame_counter);
+            default_rainbow_pattern();
             continue;
         }
 
@@ -561,7 +782,7 @@ if ((current_tick - last_battery_tick) > pdMS_TO_TICKS(10000)){
         }
         uint8_t current_raw_speed = g_speed_presets[g_selected_speed_index];
         int delay_ms = (255 - current_raw_speed) / 5;
-        
+
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 }
@@ -571,17 +792,18 @@ if ((current_tick - last_battery_tick) > pdMS_TO_TICKS(10000)){
 static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
+        conn_hdl = (event->connect.status == 0) ? event->connect.conn_handle : 0xFFFF;
             ESP_LOGI("BLE", "Connected! Status: %d", event->connect.status);
             return 0;
 
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGW("BLE", "Disconnected! Reason: %d. Restarting...", event->disconnect.reason);
-            
+            conn_hdl = 0xFFFF;
             // Safety: Reset multipart flag so we don't stay in "Loading" state
             g_multipart_active = false;
-            
+
             // AUTO-RECOVERY: Start advertising again
-            start_advertising(); 
+            start_advertising();
             return 0;
 
         case BLE_GAP_EVENT_MTU:
@@ -591,6 +813,10 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
         case BLE_GAP_EVENT_CONN_UPDATE:
             ESP_LOGI("BLE", "Connection updated");
             return 0;
+
+            default:
+                    return 0;
+
     }
     return 0;
 }
@@ -603,7 +829,7 @@ void start_advertising(void) {
 
     // --- 1. Main Advertising Packet ---
     memset(&fields, 0, sizeof(fields));
-    const char *name = "Pixel Poi"; 
+    const char *name = "Pixel Poi";
     fields.name = (uint8_t *)name;
     fields.name_len = strlen(name);
     fields.name_is_complete = 1;
@@ -639,9 +865,9 @@ void start_advertising(void) {
 
     // --- FIXED: REGISTER THE HANDLER HERE ---
     // We replace NULL with ble_gap_event_handler
-    rc = ble_gap_adv_start(BLE_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, 
+    rc = ble_gap_adv_start(BLE_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
                            &adv_params, ble_gap_event_handler, NULL);
-    
+
     if (rc != 0) {
         ESP_LOGE("BLE", "Error starting advertisement; rc=%d", rc);
     } else {
@@ -712,19 +938,19 @@ void storage_worker_task(void *pvParameters) {
                 fwrite(pkt.pkt_data, 1, write_len, f);
 
                 if (is_last) {
-					
+
                     fflush(f);
                     fsync(fileno(f));
                     fclose(f);
                     f = NULL; // Reset for next time
-                    
+
                     vTaskDelay(pdMS_TO_TICKS(100)); // Flash cool-down
-                    
+
                     g_multipart_active = false;
                     led_task_running = true;
 					ESP_LOGI("BLE", "LED Task Resumed");
-                    
-                    
+
+
                     g_reloading_pattern = true;     // Tell LED task to load new file
                     ESP_LOGI("STORAGE", "Upload finished and saved.");
                 }
@@ -736,12 +962,12 @@ void storage_worker_task(void *pvParameters) {
 //helper function
 void setTxCharacteristicValue(uint8_t* data, uint16_t len) {
     if (len > sizeof(tx_buffer)) len = sizeof(tx_buffer);
-    
+
     // Copy the actual bytes
     memcpy(tx_buffer, data, len);
     tx_len = len;
-    
-    // Log the actual hex bytes to the console so you can see them 
+
+    // Log the actual hex bytes to the console so you can see them
     // BEFORE the phone reads them.
     ESP_LOG_BUFFER_HEX("BLE_TX_DEBUG", tx_buffer, tx_len);
 }
@@ -774,7 +1000,7 @@ if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
 
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        uint8_t data[512]; 
+        uint8_t data[512];
         uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
         if (len > sizeof(data)) len = sizeof(data);
         os_mbuf_copydata(ctxt->om, 0, len, data);
@@ -795,14 +1021,14 @@ if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
 									if (payload_len >= 1) g_brightness = payload[0];
 									ESP_LOGI("BLE", "Brightness request");
 									break;
-									
+
 								case CC_SET_BRIGHTNESS_OPTION:
 									ESP_LOGI("BLE_BRIGHT", "Brightness option request");
 									ESP_LOG_BUFFER_HEX("BLE_BRIGHT_RAW", data, len);
 
 									// Using the same 4-byte structure: [Start][Cmd][Index][End]
 									if (len >= 3) {
-										uint8_t index = data[2]; 
+										uint8_t index = data[2];
 
 										if (index < 6) {
 											g_selected_brightness_index = index;
@@ -817,100 +1043,108 @@ if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
 									}
 									break;
 
-								case CC_START_STREAM: 
-    // 1. Detect Frame Start
-    if (len > 0 && data[0] == 0xD0) {
-        g_assembly_pos = 0; 
+
+//stream case start stuff
+
+
+
+
+case CC_START_STREAM: {
+    // Look for the sub-frame header in this chunk
+    int start = find_subframe_start(data, len);
+    if (start < 0) {
+        // This chunk might be only [D0, 21] (command prefix) or partial data; wait for next chunk.
+        break;
     }
 
-    // 2. Accumulate Fragments
-    if (g_assembly_pos + len <= sizeof(g_assembly_buf)) {
-        memcpy(&g_assembly_buf[g_assembly_pos], data, len);
-        g_assembly_pos += len;
+    // Feed only the sub-frame bytes into the assembler
+    if (!asm_feed(&data[start], len - start)) {
+        break; // not complete yet
     }
 
-    // 3. Process Only When Full Frame is Reassembled
-    // We expect 425 bytes: [D0][0D][LenH][LenL][420 Bytes][D1]
-    if (g_assembly_pos >= 425) {
-        // Validate Footer to ensure memory alignment is correct
-        if (g_assembly_buf[424] == 0xD1) {
-            
-            g_is_streaming = true;
-            g_last_stream_time = esp_timer_get_time() / 1000;
+    // Full sub-frame assembled: parse and verify
+    uint8_t  led_h       = asm_buf[OFF_LED_H];
+    uint16_t payload_len = ((uint16_t)asm_buf[OFF_PAYLEN_H] << 8) | asm_buf[OFF_PAYLEN_L];
+    uint16_t seq         = ((uint16_t)asm_buf[OFF_SEQ_H]    << 8) | asm_buf[OFF_SEQ_L];
 
-            // Copy only the 420 payload bytes (skipping D0, 0D, LenH, LenL)
-            memcpy(&g_ring_buffer[g_write_idx], &g_assembly_buf[4], 420);
-
-            // Move the write pointer for the render task
-            g_write_idx = (g_write_idx + 420) % RING_BUF_SIZE;
-        } else {
-            ESP_LOGE("STREAM", "Frame Corrupted: Missing D1 Footer");
-        }
-        
-        g_assembly_pos = 0; // Reset for next frame
+    int footer_idx = OFF_PAYLOAD + payload_len;
+    uint8_t footer = asm_buf[footer_idx];
+    if (footer != 0xD1) {
+        ESP_LOGE("STREAM", "Footer mismatch at %d (got %02X)", footer_idx, footer);
+        asm_reset();
+        break;
     }
+
+    // (Optional) CRC32 check here if enabled
+
+    g_stream_cfg.led_h       = (led_h <= MAX_LEDS) ? led_h : MAX_LEDS;
+    g_stream_cfg.payload_len = payload_len;
+    g_stream_cfg.active      = true;
+    g_last_stream_time       = esp_timer_get_time() / 1000;
+
+    const uint8_t *payload = &asm_buf[OFF_PAYLOAD];
+    push_frame_to_ring(payload, payload_len, seq);
+
+    asm_reset();
     break;
-										
-										case CC_STOP_STREAM:
-										g_is_streaming = false;
-										
-										// Reset Ring Buffer pointers so the next stream starts fresh
-										g_read_idx = 0;
-										g_write_idx = 0;
+}
 
-										// Inline blackout: Immediate visual feedback that stream has ended
-										for(int i = 0; i < MAX_LEDS; i++) {
-											led_strip_set_pixel(led_strip, i, 0, 0, 0);
-										}
-										led_strip_refresh(led_strip);
 
-										ESP_LOGI("BLE", "Stream Stopped & Buffer Reset");
-										break;
-								
+
+
+case CC_STOP_STREAM:
+    g_stream_cfg.active = false;
+    g_read_idx = g_write_idx = 0;
+    g_request_blackout_val = true;
+    asm_reset();
+    ESP_LOGI("BLE", "Stream Stopped & Buffer Reset");
+    break;
+
+
 								case CC_SET_SPEED_OPTION:
 									ESP_LOGI("BLE", "Speed option request");
 									ESP_LOG_BUFFER_HEX("BLE_SPEED_RAW", data, len);
 									if (len >= 2) {
-									uint8_t index = data[2]; 
+									uint8_t index = data[2];
 									if (index < 6) {
 										g_selected_speed_index = index;
-										ESP_LOGI("BLE", "Switched to Speed Gear: %d (Value: %d)", 
+										ESP_LOGI("BLE", "Switched to Speed Gear: %d (Value: %d)",
 												  g_selected_speed_index, g_speed_presets[g_selected_speed_index]);
 									    }
 								    }
-									break;								
-																
+									break;
+
 								case CC_SET_SPEED_OPTIONS:
 									ESP_LOGI("BLE", "Speed bank request");
 									// If the phone sends 6 bytes, we update the whole gearbox
-											if (len >= 7) { 
+											if (len >= 7) {
 												for(int i = 0; i < 6; i++) {
 													g_speed_presets[i] = data[i+1];
 												}
 												ESP_LOGI("BLE", "Speed Gearbox Reprogrammed!");
-										
+
  									}
 									break;
 								case CC_SET_SPEED:
 
 												ESP_LOGI("BLE", "Set speed reqwuest received");
-				
+
 									break;
 
-									
+
 								case CC_SET_BANK:
 									if (len >= 3) g_current_bank = data[2];
 									break;
-									
+
 								case CC_SET_SEQUENCER:
 									ESP_LOG_BUFFER_HEX("BLE_SPEED_RAW", data, len);
 									break;
-									
+
 								case CC_START_SEQUENCER:
 									ESP_LOG_BUFFER_HEX("BLE_SPEED_RAW", data, len);
 									break;
-									
-										
+
+
 								case CC_SET_PATTERN_SLOT:
 									if (len >= 3) {
 										g_current_slot = data[2];
@@ -922,11 +1156,11 @@ if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
 									ESP_LOGI("BLE", "Pattern Upload Started - Sending to Queue");
 									g_multipart_active = true;
 									led_task_running = false;
-									while(!led_task_paused) { vTaskDelay(1); } 
+									while(!led_task_paused) { vTaskDelay(1); }
 									ESP_LOGI("BLE", "LED Task safely parked for upload");
 									// Optional: Turn off LEDs so they don't stay stuck on one color
 									led_strip_clear(led_strip);
-									
+
 									// SHIP TO QUEUE
 									flash_packet_t pkt;
 									pkt.len = payload_len;
@@ -939,37 +1173,36 @@ if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
 
 									set_ble_reply(resp_firmware, sizeof(resp_firmware));
 									//setTxCharacteristicValue(response, 6);
-									
-									
+
 										break;
 
 								case CC_SET_PATTERN_ALL: // Shuffle all slots in CURRENT bank (d0 06 d1)
 									ESP_LOGI("SHUFFLE", "Toggle Bank Shuffle Requested");
-									
+
 									// Toggle the state: If it was true, it becomes false. If false, true.
-									g_shuffle_slots_only = !g_shuffle_slots_only; 
-									
+									g_shuffle_slots_only = !g_shuffle_slots_only;
+
 									// Safety: If we turn this on, make sure the other shuffle mode is off
 									if (g_shuffle_slots_only) {
 										g_shuffle_all_banks = false;
 										g_last_shuffle_tick = xTaskGetTickCount(); // Reset timer on start
 									}
-									
+
 									ESP_LOGW("SHUFFLE", "Bank Shuffle is now: %s", g_shuffle_slots_only ? "ON" : "OFF");
 									set_ble_reply(resp_success, sizeof(resp_success));
 									break;
 
 								case CC_SET_BANK_ALL: // Shuffle across ALL banks (d0 08 d1)
 									ESP_LOGI("SHUFFLE", "Toggle Global Shuffle Requested");
-									
+
 									// Toggle the state
 									g_shuffle_all_banks = !g_shuffle_all_banks;
-									
+
 									if (g_shuffle_all_banks) {
 										g_shuffle_slots_only = false;
 										g_last_shuffle_tick = xTaskGetTickCount(); // Reset timer on start
 									}
-									
+
 									ESP_LOGW("SHUFFLE", "Global Shuffle is now: %s", g_shuffle_all_banks ? "ON" : "OFF");
 									set_ble_reply(resp_success, sizeof(resp_success));
 									break;
@@ -978,7 +1211,7 @@ if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
 									case CC_SET_PATTERN_SHUFFLE_DURATION: // Set the timer (e.g., 0-255 seconds)
 										ESP_LOG_BUFFER_HEX("BLE_SPEED_RAW", data, len);
 										// If your app sends the value in seconds at data[2]
-										g_shuffle_duration_ms = data[2] * 1000; 
+										g_shuffle_duration_ms = data[2] * 1000;
 										if (g_shuffle_duration_ms < 1000) {
 										 g_shuffle_duration_ms = 1000; // Min 1s
 										 set_ble_reply(resp_success, sizeof(resp_success)); // Set 0x00 Success
@@ -986,7 +1219,7 @@ if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
 										set_ble_reply(resp_error, sizeof(resp_error));     // Set 0x01 Error
 									}
 									break;
-										
+
 
 								default: break;
 							}
@@ -998,10 +1231,10 @@ if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
 							flash_packet_t pkt;
 							pkt.len = len;
 							memcpy(pkt.pkt_data, data, len);
-							
+
 							if (xQueueSend(flash_queue, &pkt, pdMS_TO_TICKS(10)) != pdPASS) {
 									ESP_LOGW("BLE", "Queue full! Dropping packet or returning error.");
-									return BLE_ATT_ERR_PREPARE_QUEUE_FULL; 
+									return BLE_ATT_ERR_PREPARE_QUEUE_FULL;
 								}
 							return 0;
 						}
@@ -1051,7 +1284,7 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
                     .access_cb = gatt_svr_cb,
                     .arg = "Notify Characteristic",
                 },
-                
+
                  {0} }
             },
             {0}
@@ -1072,7 +1305,7 @@ void host_task(void *param) {
 //BLE functions
 void writeToPixelPoi(uint8_t* data) {
     uint16_t len = (data[1] << 8) | data[2];
-    
+
     // 1. Check if we even have a connection
     if (conn_hdl == 65535) {
         ESP_LOGE("BLE_DEBUG", "Notify failed: No active connection handle!");
@@ -1093,7 +1326,7 @@ void writeToPixelPoi(uint8_t* data) {
 
     // 3. Perform the notify and capture the specific NimBLE error
     int rc = ble_gatts_notify_custom(conn_hdl, notify_handle, om);
-    
+
     if (rc != 0) {
         switch (rc) {
             case 6: // BLE_HS_EDISABLED
@@ -1116,7 +1349,7 @@ void writeToPixelPoi(uint8_t* data) {
 void bleSendFWVersion() {
     // [Start][LenH][LenL][Major][Minor][Patch][End] -> Wait, this is 7 bytes?
     // Let's adjust to match your exact protocol requirements:
-    uint8_t response[] = {0xD0, 0x00, 0x06, 0x09, 0x02, 0xD1}; 
+    uint8_t response[] = {0xD0, 0x00, 0x06, 0x09, 0x02, 0xD1};
     writeToPixelPoi(response);
 }
 
@@ -1163,38 +1396,33 @@ init_spiffs();
 	xTaskCreate(host_task, "nimble_host", 8192, NULL, 15, NULL);
 
 	// 3. Start the port (this triggers the stack)
-	
-
-
-
- 
 
     // 6. Hardware Init (Keep this AFTER BLE init to ensure heap availability)
     gpio_set_direction(REGULATOR_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_level(REGULATOR_GPIO, 1);
-    
+
     // init queue
     flash_queue = xQueueCreate(20, sizeof(flash_packet_t));
     xTaskCreate(storage_worker_task, "storage_task", 6144, NULL, 4, NULL);
    // --- NEW: Initialize LED Strip ---
     led_strip_config_t strip_config = {
         .strip_gpio_num = LED_GPIO, // Ensure this matches your wiring (e.g., GPIO 8)
-        .max_leds = 144,            // The physical max of your strip
+        .max_leds = MAX_LEDS,            // The physical max of your strip
     };
     led_strip_rmt_config_t rmt_config = {
         .resolution_hz = 10 * 1000 * 1000, // 10MHz for clean timing
     };
-    
+
     // We use RMT because it's the most stable way to drive LEDs on C3
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
-    
+
     ESP_LOGI(TAG, "LED Strip Initialized.");
 // --- Button setup ---
 gpio_config_t btn_conf = {
     .pin_bit_mask = (1ULL << BOOT_BUTTON_PIN),
     .mode = GPIO_MODE_INPUT,
     .pull_up_en = GPIO_PULLUP_ENABLE,
-    .intr_type = GPIO_INTR_ANYEDGE, 
+    .intr_type = GPIO_INTR_ANYEDGE,
 };
 gpio_config(&btn_conf);
 
@@ -1224,7 +1452,7 @@ ESP_LOGI(TAG, "Battery Check Initialized");
     xTaskCreate(pov_render_task, "led_task", 10240, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "System Ready. Waiting for BLE Sync...");
-    
+
     // The main task can now just sit and watch the system or be deleted
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
