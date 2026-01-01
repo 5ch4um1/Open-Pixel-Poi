@@ -102,7 +102,7 @@ public:
         // Trigger voltage display
         config.displayState = DS_VOLTAGE;
         config.displayStateLastUpdated = millis();
-      }else if(buttonState == BS_CLICK_HOLD && millis() - downTime >= 3000){ // Click Long Hold
+      }else if(buttonState == BS_CLICK_HOLD && millis() - downTime >= 2000){ // Click Long Hold
         buttonState = BS_CLICK_HOLD_LONG;
         config.displayState = DS_SHUTDOWN;
         config.displayStateLastUpdated = millis();
@@ -144,26 +144,28 @@ public:
         config.displayState = DS_PATTERN;
         config.displayStateLastUpdated = millis();
       }else if(buttonState == BS_CLICK2_HOLD){
-        if(millis() - downTime < 1000){
+        // 7 options, 500ms each, 0-3500ms, offset by 500 for initial press animation
+        int selection = ((millis() - downTime - 500) % 3500) / 500;
+        if(selection == 0){
           config.setPatternBank(0, true);
           config.displayState = DS_PATTERN;
           config.displayStateLastUpdated = millis();
-        }else if(millis() - downTime < 1500){
+        }else if(selection == 1){
           config.setPatternBank(1, true);
           config.displayState = DS_PATTERN;
           config.displayStateLastUpdated = millis();
-        }else if(millis() - downTime < 2000){
+        }else if(selection == 2){
           config.setPatternBank(2, true);
           config.displayState = DS_PATTERN;
           config.displayStateLastUpdated = millis();
-        }else if(millis() - downTime < 2500){
+        }else if(selection == 3){
           config.displayState = DS_PATTERN_ALL_ALL;
           config.displayStateLastUpdated = millis();
-        }else if(millis() - downTime < 3000){
+        }else if(selection == 4){
           config.setPatternBank(0, true);
           config.displayState = DS_PATTERN_ALL;
           config.displayStateLastUpdated = millis();
-        }else if(millis() - downTime < 3500){
+        }else if(selection == 5){
           config.setPatternBank(1, true);
           config.displayState = DS_PATTERN_ALL;
           config.displayStateLastUpdated = millis();
@@ -175,42 +177,34 @@ public:
         buttonState = BS_INITIAL;
       }else if(buttonState == BS_CLICK3_HOLD){
         if(millis() - downTime < 1000){
-          config.setLedBrightness(1);
+          config.setLedBrightness(config.ledBrightnessOptions[0]);
         }else if(millis() - downTime < 1500){
-          config.setLedBrightness(4);
+          config.setLedBrightness(config.ledBrightnessOptions[1]);
         }else if(millis() - downTime < 2000){
-          config.setLedBrightness(10);
+          config.setLedBrightness(config.ledBrightnessOptions[2]);
         }else if(millis() - downTime < 2500){
-          config.setLedBrightness(25);
+          config.setLedBrightness(config.ledBrightnessOptions[3]);
+        }else if(millis() - downTime < 3000){
+          config.setLedBrightness(config.ledBrightnessOptions[4]);
         }else{
-          config.setLedBrightness(100);
+          config.setLedBrightness(config.ledBrightnessOptions[5]);
         }
         buttonState = BS_INITIAL;
         config.displayState = DS_PATTERN;
         config.displayStateLastUpdated = millis();
       }else if(buttonState == BS_CLICK4_HOLD){
         if(millis() - downTime < 1000){
-          config.setAnimationSpeed(1);
+          config.setAnimationSpeed(config.animationSpeedOptions[0]);
         }else if(millis() - downTime < 1500){
-          config.setAnimationSpeed(2);
+          config.setAnimationSpeed(config.animationSpeedOptions[1]);
         }else if(millis() - downTime < 2000){
-          config.setAnimationSpeed(5);
+          config.setAnimationSpeed(config.animationSpeedOptions[2]);
         }else if(millis() - downTime < 2500){
-          config.setAnimationSpeed(10);
+          config.setAnimationSpeed(config.animationSpeedOptions[3]);
         }else if(millis() - downTime < 3000){
-          config.setAnimationSpeed(20);
-        }else if(millis() - downTime < 3500){
-          config.setAnimationSpeed(35);
-        }else if(millis() - downTime < 4000){
-          config.setAnimationSpeed(60);
-        }else if(millis() - downTime < 4500){
-          config.setAnimationSpeed(100);
-        }else if(millis() - downTime < 5000){
-          config.setAnimationSpeed(150);
-        }else if(millis() - downTime < 5500){
-          config.setAnimationSpeed(200);
+          config.setAnimationSpeed(config.animationSpeedOptions[4]);
         }else{
-          config.setAnimationSpeed(250);
+          config.setAnimationSpeed(config.animationSpeedOptions[5]);
         }
         buttonState = BS_INITIAL;
         config.displayState = DS_PATTERN;
@@ -253,7 +247,13 @@ public:
     }
 
     // Read battery voltage
-    config.batteryVoltage = (config.batteryVoltage * 0.999) + ((analogReadMilliVolts(A0)/500.0) * .001);
+    if(BATTERY_VOLTAGE_SENSOR){
+      config.batteryVoltage = (config.batteryVoltage * 0.999) + ((analogReadMilliVolts(A0)/500.0) * .001);
+    }else{
+      config.batteryVoltage = 4.2;
+    }
+
+    
 
     // Super low voltage, emergency shutdown (uses data from previous read, this is ok). 
     if (config.batteryState == BAT_SHUTDOWN && config.displayState != DS_SHUTDOWN){

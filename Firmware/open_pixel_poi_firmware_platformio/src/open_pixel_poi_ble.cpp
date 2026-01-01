@@ -1,6 +1,7 @@
 // Some things need to be included here, seems files are loaded alphabetically
 #include <arduino.h>
 #include <Update.h>
+#include "config.h"
 #include "open_pixel_poi_config.cpp"
 
 // BLE
@@ -51,16 +52,27 @@
 // D0 04 03 03 00 00 FF 00 00 00 00 00 FF 00 00 00 00 00 FF 00 00 00 00 00 FF 00 00 00 00 00 FF D1 (solid blue x)
 
 enum CommCode {
-  CC_SUCCESS,           // 0
-  CC_ERROR,             // 1
-  CC_SET_BRIGHTNESS,    // 2
-  CC_SET_SPEED,         // 3
-  CC_SET_PATTERN,       // 4
-  CC_SET_PATTERN_SLOT,  // 5
-  CC_SET_PATTERN_ALL,   // 6
-  CC_SET_BANK,          // 7
-  CC_SET_BANK_ALL,      // 8
-  CC_GET_FW_VERSION,    // 9
+  CC_SUCCESS,                     // 0
+  CC_ERROR,                       // 1
+  CC_SET_BRIGHTNESS,              // 2
+  CC_SET_SPEED,                   // 3
+  CC_SET_PATTERN,                 // 4
+  CC_SET_PATTERN_SLOT,            // 5
+  CC_SET_PATTERN_ALL,             // 6
+  CC_SET_BANK,                    // 7
+  CC_SET_BANK_ALL,                // 8
+  CC_GET_FW_VERSION,              // 9
+  CC_SET_HARDWARE_VERSION,        // 10
+  CC_SET_LED_TYPE,                // 11
+  CC_SET_LED_COUNT,               // 12
+  CC_SET_DEVICE_NAME,             // 13
+  CC_SET_SEQUENCER,               // 14
+  CC_START_SEQUENCER,             // 15
+  CC_SET_BRIGHTNESS_OPTION,       // 16
+  CC_SET_BRIGHTNESS_OPTIONS,      // 17
+  CC_SET_SPEED_OPTION,            // 18
+  CC_SET_SPEED_OPTIONS,           // 19
+  CC_SET_PATTERN_SHUFFLE_DURATION,// 20
 };
 
 class OpenPixelPoiBLE : public BLEServerCallbacks, public BLECharacteristicCallbacks{
@@ -86,17 +98,17 @@ class OpenPixelPoiBLE : public BLEServerCallbacks, public BLECharacteristicCallb
     BLECharacteristic* pixelPoiNotifyCharacteristic;
 
     void bleSendError(){
-      uint8_t response[] = {0x45, 0x46, 0x00, 0x07, CC_ERROR, 0x46, 0x45};
+      uint8_t response[] = {0xD0, 0x00, 0x05, CC_ERROR, 0xD1};
       writeToPixelPoi(response);
     }
     
     void bleSendSuccess(){
-      uint8_t response[] = {0x45, 0x46, 0x00, 0x07, CC_SUCCESS, 0x46, 0x45};
+      uint8_t response[] = {0xD0, 0x00, 0x05, CC_SUCCESS, 0xD1};
       writeToPixelPoi(response);
     }
 
     void bleSendFWVersion(){
-      uint8_t response[] = {0x45, 0x46, 0x00, 0x08, CC_GET_FW_VERSION, 0x01, 0x46, 0x45};
+      uint8_t response[] = {0xD0, 0x00, 0x06, CC_GET_FW_VERSION, 0x02, 0xD1};
       writeToPixelPoi(response);
     }
     
@@ -104,11 +116,11 @@ class OpenPixelPoiBLE : public BLEServerCallbacks, public BLECharacteristicCallb
     OpenPixelPoiBLE(OpenPixelPoiConfig& _config): config(_config) {}
 
     long bleLastReceived;
-    bool flagMultipartPattern = false;
+    uint8_t multipartPattern = 0;
     void setup(){
       debugf("Setup begin\n");
       // Create the BLE Device
-      BLEDevice::init("Open Pixel Poi");
+      BLEDevice::init(config.deviceName.c_str());
 
       // Create the BLE Server
       server = BLEDevice::createServer();
@@ -149,7 +161,7 @@ class OpenPixelPoiBLE : public BLEServerCallbacks, public BLECharacteristicCallb
 
     void writeToPixelPoi(uint8_t* data){
       if (deviceConnected) {
-        pixelPoiTxCharacteristic->setValue(data, data[2] << 8 | data[3]);
+        pixelPoiTxCharacteristic->setValue(data, data[1] << 8 | data[2]);
         pixelPoiNotifyCharacteristic->notify();
       }
     }
@@ -171,13 +183,13 @@ class OpenPixelPoiBLE : public BLEServerCallbacks, public BLECharacteristicCallb
         debugf("\n");
         
         // Process BLE
-        if(bleStatus[0] == 0xD0 && bleStatus[bleLength - 1] == 0xD1 && !flagMultipartPattern){
+        if(bleStatus[0] == 0xD0 && bleStatus[bleLength - 1] == 0xD1 && multipartPattern == 0){
           CommCode requestCode = static_cast<CommCode>(bleStatus[1]);
           if(requestCode == CC_SET_BRIGHTNESS){
             config.setLedBrightness(bleStatus[2]);
             bleSendSuccess();
           }else if(requestCode == CC_SET_SPEED){
-            config.setAnimationSpeed(bleStatus[2]);
+            config.setAnimationSpeed(bleStatus[2] << 8 | bleStatus[3]);
             bleSendSuccess();
           }else if(requestCode == CC_SET_PATTERN){
             for (int i=0; i<sizeof(config.pattern); i++){
@@ -212,14 +224,93 @@ class OpenPixelPoiBLE : public BLEServerCallbacks, public BLECharacteristicCallb
             bleSendSuccess();
           }else if(requestCode == CC_GET_FW_VERSION){
             bleSendFWVersion();
+          }else if(requestCode == CC_SET_HARDWARE_VERSION){
+            config.setHardwareVersion(bleStatus[2]);
+            bleSendSuccess();
+          }else if(requestCode == CC_SET_LED_TYPE){
+            config.setLedType(bleStatus[2]);
+            bleSendSuccess();
+          }else if(requestCode == CC_SET_LED_COUNT){
+            config.setLedCount(bleStatus[2]);
+            bleSendSuccess();
+          }else if(requestCode == CC_SET_DEVICE_NAME){
+            if(bleLength > 3 && bleLength <= 18){
+              config.setDeviceName(String((char*)bleStatus).substring(2, bleLength -1) + " Pixel Poi");
+              bleSendSuccess();
+            }else{
+              bleSendError();
+            }
+          }else if(requestCode == CC_SET_SEQUENCER){
+            for (int i=0; i<sizeof(config.sequencer); i++){
+              config.sequencer[i]=0;
+            }
+            config.sequencerLength = bleStatus[2] << 8 | bleStatus[3];
+            config.sequencerStep = config.sequencerLength/7; // Dont trigger
+            for (int i=0; i < config.sequencerLength; i++){
+              config.sequencer[i]=bleStatus[i+4];
+            }
+            config.saveSequencer();
+            bleSendSuccess();
+          }else if(requestCode == CC_START_SEQUENCER){
+            config.sequencerStep = -1;
+            bleSendSuccess();
+          }else if(requestCode == CC_SET_BRIGHTNESS_OPTION){
+            if(bleStatus[2] >= 0 && bleStatus[2] <= 5){
+              config.setLedBrightness(config.ledBrightnessOptions[bleStatus[2]]);
+              bleSendSuccess();
+            }else{
+              bleSendError();
+            }
+          }else if(requestCode == CC_SET_BRIGHTNESS_OPTIONS){
+            if(bleLength == 9){
+              config.setLedBrightnessOptions(
+                bleStatus[2], 
+                bleStatus[3], 
+                bleStatus[4],
+                bleStatus[5], 
+                bleStatus[6], 
+                bleStatus[7]
+              );
+              bleSendSuccess();
+            }else{
+              bleSendError();
+            }
+          }else if(requestCode == CC_SET_SPEED_OPTION){
+            if(bleStatus[2] >= 0 && bleStatus[2] <= 5){
+              config.setAnimationSpeed(config.animationSpeedOptions[bleStatus[2]]);
+              bleSendSuccess();
+            }else{
+              bleSendError();
+            }
+          }else if(requestCode == CC_SET_SPEED_OPTIONS){
+            if(bleLength == 15){
+              config.setAnimationSpeedOptions(
+                bleStatus[2] << 8 | bleStatus[3], 
+                bleStatus[4] << 8 | bleStatus[5], 
+                bleStatus[6] << 8 | bleStatus[7],
+                bleStatus[8] << 8 | bleStatus[9], 
+                bleStatus[10] << 8 | bleStatus[11], 
+                bleStatus[12] << 8 | bleStatus[13]
+              );
+              bleSendSuccess();
+            }else{
+              bleSendError();
+            }
+          }else if(requestCode == CC_SET_PATTERN_SHUFFLE_DURATION){
+            if(bleLength == 4){
+              config.setPatternShuffleDuration(bleStatus[2]);
+              bleSendSuccess();
+            }else{
+              bleSendError();
+            }
           }else{
             debugf("Recieved message with unknown code!\n");
             bleSendError();
           }
         }else{
-          if(!flagMultipartPattern && bleStatus[0] == 0xD0 && static_cast<CommCode>(bleStatus[1]) == CC_SET_PATTERN){
+          if(multipartPattern == 0 && bleStatus[0] == 0xD0 && static_cast<CommCode>(bleStatus[1]) == CC_SET_PATTERN){
             debugf("Start multipart pattern! %d bits\n", bleStatus[2] * (bleStatus[3] << 8 | bleStatus[4]));
-            flagMultipartPattern = true;
+            multipartPattern = 1;
             multipartPatternOffset = 0;
             for (int i=0; i<sizeof(config.pattern); i++){
               config.pattern[i]=0;
@@ -227,15 +318,14 @@ class OpenPixelPoiBLE : public BLEServerCallbacks, public BLECharacteristicCallb
             config.setFrameHeight(bleStatus[2]);
             config.setFrameCount(bleStatus[3] << 8 | bleStatus[4]);
             config.patternLength = config.frameHeight*config.frameCount*3;// Need exception handling for buffer overruns!!!
-            if(config.patternLength > 24000){
-//              config.setPatternSlot(config.patternSlot);
+            if(config.patternLength > PATTERN_PIXEL_LIMIT * 3){
               // set error pattern
-              config.setFrameHeight(20);
+              config.setFrameHeight(1);
               config.setFrameCount(2);
-              config.patternLength = 120;
+              config.patternLength = 6;
               config.fillDefaultPattern();
               config.savePattern();
-              flagMultipartPattern = false;
+              multipartPattern = 0;
               return;
             }
             
@@ -243,9 +333,9 @@ class OpenPixelPoiBLE : public BLEServerCallbacks, public BLECharacteristicCallb
               config.pattern[multipartPatternOffset] = bleStatus[i];
               multipartPatternOffset++;
             }
-          }else if(flagMultipartPattern && bleLength < 509){
+          }else if(multipartPattern == 1 && bleLength < 509){
             debugf("End multipart message!\n");
-            flagMultipartPattern = false;
+            multipartPattern = 0;
 
             for (int i= 0; i < bleLength - 1; i++){
               config.pattern[multipartPatternOffset] = bleStatus[i];
@@ -253,7 +343,7 @@ class OpenPixelPoiBLE : public BLEServerCallbacks, public BLECharacteristicCallb
             }
             
             config.savePattern();
-          }else if(flagMultipartPattern){
+          }else if(multipartPattern == 1){
             debugf("Middle of multipart message! Offset = %d\n", multipartPatternOffset);
             for (int i= 0; i < bleLength; i++){
               config.pattern[multipartPatternOffset] = bleStatus[i];

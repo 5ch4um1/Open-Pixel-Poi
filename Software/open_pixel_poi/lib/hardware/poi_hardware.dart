@@ -3,8 +3,10 @@ import 'dart:async';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 // import 'package:flutter_blue_plus_windows/flutter_blue_plus_windows.dart';
 import 'package:open_pixel_poi/database/dbimage.dart';
+import 'package:open_pixel_poi/hardware/models/fw_version.dart';
 import 'package:rxdart/rxdart.dart';
 
+import '../pages/pattern_creators/create_sequence.dart';
 import './models/comm_code.dart';
 import 'ble_uart.dart';
 import 'models/confirmtation.dart';
@@ -100,8 +102,11 @@ class PoiHardware {
   }
 
   Future<dynamic> readResponse() async {
-
-    await uart.txCharacteristic.read();
+    try{
+      await uart.txCharacteristic.read();
+    }catch(e){
+      Confirmation(false);
+    }
 
     _buffer = List<int>.empty(growable: true);
     _buffer.addAll(uart.txCharacteristic.lastValue);
@@ -116,14 +121,14 @@ class PoiHardware {
     }
 
     // Check packet length
-    // int packetLength = (_buffer[2] << 8) + _buffer[3];
-    // if (_buffer.length != packetLength) {
-    //   print("onRecievePacket: Invalid packet length, discarding");
-    //   _buffer = null;
-    //   return;
-    // }
+    int packetLength = (_buffer[1] << 8) + _buffer[2];
+    if (_buffer.length != packetLength) {
+      print("onRecievePacket: Invalid packet length ($packetLength), discarding");
+      _buffer = List.empty();
+      return;
+    }
 
-    List<int> message = _buffer.sublist(1, _buffer.length -1);
+    List<int> message = _buffer.sublist(3, _buffer.length -1);
     print("onRecievePacket: Found message: " + message.toString());
     _buffer = List.empty();
     return onRecieveMessage(message);
@@ -131,11 +136,14 @@ class PoiHardware {
 
   dynamic onRecieveMessage(List<int> message) {
     CommCode commCode = CommCode.values[message.removeAt(0)];
+    print("Message recieved: code = $commCode, message = $message");
     switch (commCode) {
       case CommCode.CC_SUCCESS:
         return Confirmation(true);
       case CommCode.CC_ERROR:
         return Confirmation(false);
+      case CommCode.CC_GET_FW_VERSION:
+        return FWVersion(message[0]);
      default:
         print("Unhandled message recieved: code = $commCode, message = $message");
         return null;
@@ -167,6 +175,34 @@ class PoiHardware {
     message.insert(0, code.index);
     return _sendIt(message, confirmation);
   }
+  Future<bool> sendInt8Array(List<int> values, CommCode code, [bool confirmation = true]) {
+    List<int> message = [];
+    ParseUtil.putInt8(message, code.index);
+    for(int value in values){
+      ParseUtil.putInt8(message, value);
+    }
+    return _sendIt(message, confirmation);
+  }
+  Future<bool> sendInt16(int value, CommCode code, [bool confirmation = true]) {
+    List<int> message = [];
+    ParseUtil.putInt8(message, code.index);
+    ParseUtil.putInt16(message, value);
+    return _sendIt(message, confirmation);
+  }
+  Future<bool> sendInt16Array(List<int> values, CommCode code, [bool confirmation = true]) {
+    List<int> message = [];
+    ParseUtil.putInt8(message, code.index);
+    for(int value in values){
+      ParseUtil.putInt16(message, value);
+    }
+    return _sendIt(message, confirmation);
+  }
+  Future<bool> sendString(String value, CommCode code, [bool confirmation = true]) {
+    List<int> message = [];
+    ParseUtil.putInt8(message, code.index);
+    ParseUtil.putString(message, value);
+    return _sendIt(message, confirmation);
+  }
   Future<bool> sendPattern(LEDPattern pattern) {
     List<int> message = [];
     ParseUtil.putInt8(message, CommCode.CC_SET_PATTERN.index);
@@ -186,6 +222,20 @@ class PoiHardware {
     ParseUtil.putInt8(message, pattern.height);
     ParseUtil.putInt16(message, pattern.count);
     ParseUtil.putInt8List(message, pattern.bytes);
+    return _sendIt(message);
+  }
+
+  Future<bool> sendSequence(List<SegmentValues> segments) {
+    List<int> message = [];
+    ParseUtil.putInt8(message, CommCode.CC_SET_SEQUENCER.index);
+    ParseUtil.putInt16(message, segments.length * 7);
+    for(SegmentValues segment in segments){
+      ParseUtil.putInt8(message, segment.pattern - 1);
+      ParseUtil.putInt8(message, segment.bank - 1);
+      ParseUtil.putInt8(message, segment.brightness);
+      ParseUtil.putInt16(message, segment.speed);
+      ParseUtil.putInt16(message, segment.duration);
+    }
     return _sendIt(message);
   }
 }
