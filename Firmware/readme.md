@@ -24,3 +24,5 @@ Switch to your esp-idf dev environment (if not done already, I'd recommend to se
 Build with ```idf.py build``` flash with ```idf.py flash``` and check debug messages via USB with ```idf.py monitor```
 
 In case you missed all the other warnigns above: **Do NOT use the esp-idf firmware unless you really know what you are doing.**
+
+Experimental web app to test the streaming mode: https://5ch4um1.es/oppstream.html 
