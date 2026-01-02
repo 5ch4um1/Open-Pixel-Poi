@@ -136,6 +136,7 @@ static uint16_t current_offset = 0;
 static uint8_t frame_queue[TOTAL_DATA_LEN * 2];
 volatile int frames_available = 0;
 static int current_frame_idx = 0;
+static bool is_writing_to_buffer = false;
 
 typedef struct {
     uint8_t frames[MAX_FRAMES][FRAME_SIZE]; // 928 * 60 bytes
@@ -814,8 +815,8 @@ static int gatt_svr_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_ga
                 // If Python sends 500Hz, bytes are [0x01, 0x01, 0xF4]
                 uint16_t requested_hz = 200; // Default fallback
                 led_task_running = false;
-                if (len >= 3) {
-                    requested_hz = (data[1] << 8) | data[2];
+                if (len >= 4) {
+                    requested_hz = (data[2] << 8) | data[2];
                 }
 
                 if (requested_hz > 0) {
@@ -859,6 +860,7 @@ static int gatt_svr_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_ga
                 uint8_t temp_flat_buf[482];
                 uint16_t actual_len;
                 led_task_running = false;
+                is_writing_to_buffer = true;
                 // This function pulls the data out of the potentially fragmented mbuf 'om'
                 int rc = ble_hs_mbuf_to_flat(ctxt->om, temp_flat_buf, sizeof(temp_flat_buf), &actual_len);
 
@@ -870,6 +872,7 @@ static int gatt_svr_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_ga
                     // Reset our playback pointers
                     current_frame_idx = 0;
                     frames_available = FRAMES_PER_PACKET; // Set to 8
+                    is_writing_to_buffer = false;
                 } else {
                     ESP_LOGE("BLE", "Failed to flatten mbuf or length mismatch: %d, len: %d", rc, actual_len);
                 }
@@ -1117,6 +1120,7 @@ void update_timer_frequency(int hz) {
 
 //streaming timer
 void IRAM_ATTR pov_timer_callback(void* arg) {
+    if (is_writing_to_buffer) return;
     if (frames_available > 0) {
         // Pointer to the start of the current frame in the buffer
         uint8_t *frame_ptr = &frame_queue[current_frame_idx * FRAME_SIZE];
