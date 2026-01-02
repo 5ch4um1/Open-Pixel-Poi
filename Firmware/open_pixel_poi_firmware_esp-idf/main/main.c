@@ -207,14 +207,12 @@ void set_ble_reply(const uint8_t *data, uint16_t len) {
     }
 }
 
-
 // Save to file logic
 
 bool g_multipart_active = false;
 int current_active_slot = 0;       // Controlled by CC_SET_PATTERN_SLOT
 uint8_t g_strip_height = 0;   // Extracted from the pattern data
 uint16_t g_pattern_width = 0; // Extracted from the pattern data
-
 
 // Janitor task
 void run_storage_janitor() {
@@ -757,4 +755,507 @@ static int gatt_svr_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_ga
                 config_resp[4] = (uint8_t)((928 >> 8) & 0xFF);
                 config_resp[5] = (uint8_t)(928 & 0xFF);
 
-                // Continue...
+                // FPS (e.g., 200)
+                config_resp[6] = (uint8_t)((200 >> 8) & 0xFF);
+                config_resp[7] = (uint8_t)(200 & 0xFF);
+
+                // Firmware Version (e.g., 1)
+                config_resp[8] = 0x01;
+                config_resp[9] = 0xA4;
+
+                // 2. Allocate mbuf and send via the Notify Handle
+                // We use ble_gatt_server_send_notify (standard) or indicate
+                struct os_mbuf *om = ble_hs_mbuf_from_flat(config_resp, sizeof(config_resp));
+                if (om != NULL) {
+                    // notify_handle is the val_handle from your NOTIFY_UUID definition
+                    int rc = ble_gattc_notify_custom(conn_handle, notify_handle, om);
+                    if (rc != 0) {
+                        ESP_LOGE("BLE", "Error sending config notification; rc=%d", rc);
+                    } else {
+                        ESP_LOGI("BLE", "Config notification sent");
+                    }
+                } else {
+                    ESP_LOGE("BLE", "Failed to allocate mbuf for config response");
+                }
+            }
+            break;
+
+            case CC_SET_BRIGHTNESS:
+                ESP_LOG_BUFFER_HEX("BLE_SPEED_RAW", data, len);
+                if (payload_len >= 1) g_brightness = payload[0];
+                ESP_LOGI("BLE", "Brightness request");
+                break;
+
+            case CC_SET_BRIGHTNESS_OPTION:
+                ESP_LOGI("BLE_BRIGHT", "Brightness option request");
+                ESP_LOG_BUFFER_HEX("BLE_BRIGHT_RAW", data, len);
+
+                // Using the same 4-byte structure: [Start][Cmd][Index][End]
+                if (len >= 3) {
+                    uint8_t index = data[2];
+
+                    if (index < 6) {
+                        g_selected_brightness_index = index;
+                        // Update the actual brightness variable used in the LED loop
+                        g_brightness = g_brightness_presets[g_selected_brightness_index];
+
+                        ESP_LOGW("BLE_BRIGHT", ">>> Gear %d selected. Real Brightness: %d/255",
+                                 index, g_brightness);
+                    } else {
+                        ESP_LOGE("BLE_BRIGHT", ">>> ERROR: Index %d out of bounds", index);
+                    }
+                }
+                break;
+
+            //stream case start stuff
+
+            case CC_START_STREAM: {
+                // We expect 3 bytes: [Command, Hz_High, Hz_Low]
+                // If Python sends 500Hz, bytes are [0x01, 0x01, 0xF4]
+                uint16_t requested_hz = 200; // Default fallback
+                led_task_running = false;
+                if (len >= 3) {
+                    requested_hz = (data[1] << 8) | data[2];
+                }
+
+                if (requested_hz > 0) {
+                    uint64_t period_us = 1000000 / requested_hz;
+
+                    // Safety: Stop timer if it was already running before re-configuring
+                    esp_timer_stop(pov_timer);
+
+                    // Reset our playback counters for the new stream
+                    frames_available = 0;
+                    current_frame_idx = 0;
+
+                    // Start hardware timer at the new flexible interval
+                    esp_timer_start_periodic(pov_timer, period_us);
+
+                    ESP_LOGI("BLE", "Stream Started: Frequency set to %u Hz (%llu us)", requested_hz, period_us);
+                }
+            }
+            break;
+
+            case CC_STOP_STREAM: {
+                // Halt the timer immediately
+                esp_timer_stop(pov_timer);
+                led_task_running = true;
+                // Clear playback state
+                frames_available = 0;
+                current_frame_idx = 0;
+
+                // Clear the physical LEDs so they don't stay "stuck" on
+                if (led_strip) {
+                    led_strip_clear(led_strip);
+                    led_strip_refresh(led_strip);
+                }
+
+                ESP_LOGI("BLE", "Stream Stopped: Timer halted and LEDs cleared");
+            }
+            break;
+
+            case CC_STREAM_DATA: {
+                // Temporary buffer to hold the 1 byte command + 480 bytes data
+                uint8_t temp_flat_buf[482];
+                uint16_t actual_len;
+                led_task_running = false;
+                // This function pulls the data out of the potentially fragmented mbuf 'om'
+                int rc = ble_hs_mbuf_to_flat(ctxt->om, temp_flat_buf, sizeof(temp_flat_buf), &actual_len);
+
+                if (rc == 0 && actual_len >= 482) {
+                    // temp_flat_buf[0] is the CC_STREAM_DATA command
+                    // Copy the 480 bytes starting from index 1
+                    memcpy(frame_queue, &temp_flat_buf[2], TOTAL_DATA_LEN);
+
+                    // Reset our playback pointers
+                    current_frame_idx = 0;
+                    frames_available = FRAMES_PER_PACKET; // Set to 8
+                } else {
+                    ESP_LOGE("BLE", "Failed to flatten mbuf or length mismatch: %d, len: %d", rc, actual_len);
+                }
+            }
+            break;
+
+            case CC_SET_SPEED_OPTION:
+                ESP_LOGI("BLE", "Speed option request");
+                ESP_LOG_BUFFER_HEX("BLE_SPEED_RAW", data, len);
+                if (len >= 2) {
+                    uint8_t index = data[2];
+                    if (index < 6) {
+                        g_selected_speed_index = index;
+                        ESP_LOGI("BLE", "Switched to Speed Gear: %d (Value: %d)",
+                                 g_selected_speed_index, g_speed_presets[g_selected_speed_index]);
+                    }
+                }
+                break;
+
+            case CC_SET_SPEED_OPTIONS:
+                ESP_LOGI("BLE", "Speed bank request");
+                // If the phone sends 6 bytes, we update the whole gearbox
+                if (len >= 7) {
+                    for (int i = 0; i < 6; i++) {
+                        g_speed_presets[i] = data[i+1];
+                    }
+                    ESP_LOGI("BLE", "Speed Gearbox Reprogrammed!");
+                }
+                break;
+
+            case CC_SET_SPEED:
+                ESP_LOGI("BLE", "Set speed reqwuest received");
+                break;
+
+            case CC_SET_BANK:
+                if (len >= 3) g_current_bank = data[2];
+                break;
+
+            case CC_SET_SEQUENCER:
+                ESP_LOG_BUFFER_HEX("BLE_SPEED_RAW", data, len);
+                break;
+
+            case CC_START_SEQUENCER:
+                ESP_LOG_BUFFER_HEX("BLE_SPEED_RAW", data, len);
+                break;
+
+            case CC_SET_PATTERN_SLOT:
+                if (len >= 3) {
+                    g_current_slot = data[2];
+                    g_reloading_pattern = true; // Trigger LED reload
+                }
+                break;
+
+            case CC_SET_PATTERN:
+                ESP_LOGI("BLE", "Pattern Upload Started - Sending to Queue");
+                g_multipart_active = true;
+                led_task_running = false;
+                while (!led_task_paused) { vTaskDelay(1); }
+                ESP_LOGI("BLE", "LED Task safely parked for upload");
+                // Optional: Turn off LEDs so they don't stay stuck on one color
+                led_strip_clear(led_strip);
+
+                // SHIP TO QUEUE
+                flash_packet_t pkt;
+                pkt.len = payload_len;
+                memcpy(pkt.pkt_data, payload, payload_len);
+                xQueueSend(flash_queue, &pkt, portMAX_DELAY);
+                break;
+
+            case CC_GET_FW_VERSION:
+                ESP_LOGI("BLE", "Firmware version requested, sending direct response...");
+                //uint8_t response[] = {0xD0, 0x00, 0x06, 0x09, 0x02, 0xD1};
+
+                set_ble_reply(resp_firmware, sizeof(resp_firmware));
+                //setTxCharacteristicValue(response, 6);
+                break;
+
+            case CC_SET_PATTERN_ALL: // Shuffle all slots in CURRENT bank (d0 06 d1)
+                ESP_LOGI("SHUFFLE", "Toggle Bank Shuffle Requested");
+
+                // Toggle the state: If it was true, it becomes false. If false, true.
+                g_shuffle_slots_only = !g_shuffle_slots_only;
+
+                // Safety: If we turn this on, make sure the other shuffle mode is off
+                if (g_shuffle_slots_only) {
+                    g_shuffle_all_banks = false;
+                    g_last_shuffle_tick = xTaskGetTickCount(); // Reset timer on start
+                }
+
+                ESP_LOGW("SHUFFLE", "Bank Shuffle is now: %s", g_shuffle_slots_only ? "ON" : "OFF");
+                set_ble_reply(resp_success, sizeof(resp_success));
+                break;
+
+            case CC_SET_BANK_ALL: // Shuffle across ALL banks (d0 08 d1)
+                ESP_LOGI("SHUFFLE", "Toggle Global Shuffle Requested");
+
+                // Toggle the state
+                g_shuffle_all_banks = !g_shuffle_all_banks;
+
+                if (g_shuffle_all_banks) {
+                    g_shuffle_slots_only = false;
+                    g_last_shuffle_tick = xTaskGetTickCount(); // Reset timer on start
+                }
+
+                ESP_LOGW("SHUFFLE", "Global Shuffle is now: %s", g_shuffle_all_banks ? "ON" : "OFF");
+                set_ble_reply(resp_success, sizeof(resp_success));
+                break;
+
+            case CC_SET_PATTERN_SHUFFLE_DURATION: // Set the timer (e.g., 0-255 seconds)
+                ESP_LOG_BUFFER_HEX("BLE_SPEED_RAW", data, len);
+                // If your app sends the value in seconds at data[2]
+                g_shuffle_duration_ms = data[2] * 1000;
+                if (g_shuffle_duration_ms < 1000) {
+                    g_shuffle_duration_ms = 1000; // Min 1s
+                    set_ble_reply(resp_success, sizeof(resp_success)); // Set 0x00 Success
+                } else {
+                    set_ble_reply(resp_error, sizeof(resp_error));     // Set 0x01 Error
+                }
+                break;
+
+            default:
+                break;
+            }
+            return 0;
+        }
+
+        // --- DATA CHUNK HANDLING (Multipart) ---
+        if (g_multipart_active) {
+            flash_packet_t pkt;
+            pkt.len = len;
+            memcpy(pkt.pkt_data, data, len);
+
+            if (xQueueSend(flash_queue, &pkt, pdMS_TO_TICKS(10)) != pdPASS) {
+                ESP_LOGW("BLE", "Queue full! Dropping packet or returning error.");
+                return BLE_ATT_ERR_PREPARE_QUEUE_FULL;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/* 1. Define Characteristics Array First */
+static const struct ble_gatt_chr_def gatt_characteristics[] = {
+    {
+        // RX Characteristic
+        .uuid = (ble_uuid_t *)&rx_uuid,
+        .access_cb = gatt_svr_cb,
+        .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+    },
+    {
+        // TX Characteristic
+        .uuid = (ble_uuid_t *)&tx_uuid,
+        .access_cb = gatt_svr_cb,
+        .flags = BLE_GATT_CHR_F_READ,
+    },
+    {
+        // NOTIFY Characteristic
+        .uuid = (ble_uuid_t *)&notify_uuid,
+        .access_cb = gatt_svr_cb,
+        .flags = BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &notify_handle,
+    },
+    {0} // Terminator
+};
+
+/* 2. Define the Service Table pointing to the array above */
+static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = (ble_uuid_t *)&svc_uuid,
+        .characteristics = gatt_characteristics, // Point to the named array
+    },
+    {0}, // Terminator
+};
+
+void host_task(void *param) {
+    ESP_LOGI("BLE", "NimBLE Host Task Started");
+
+    /* This function will not return until nimble_port_stop() is executed */
+    nimble_port_run();
+
+    /* Clean up when the loop finishes */
+    nimble_port_freertos_deinit();
+}
+//BLE functions
+void writeToPixelPoi(uint8_t* data) {
+    // 1. Data Validation: Incoming 'data' is 60 bytes of RGB
+    // (Assuming the caller stripped the old headers or adjusted length)
+    uint16_t incoming_len = 60;
+
+    // 2. Safety Check: Handle & Connection
+    if (conn_hdl == 65535 || notify_handle == 0) {
+        return;
+    }
+
+    // 3. PACKING LOGIC: Copy incoming frame into our "Big Box"
+    memcpy(&packed_buffer[current_offset], data, incoming_len);
+    current_offset += incoming_len;
+
+    // 4. Check if the "Big Box" is full (8 frames = 480 bytes)
+    if (current_offset >= TOTAL_DATA_LEN) {
+
+        // Convert the flat packed buffer into an mbuf for NimBLE
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(packed_buffer, TOTAL_DATA_LEN);
+
+        if (!om) {
+            ESP_LOGE("BLE_DEBUG", "Mbuf allocation failed!");
+            current_offset = 0; // Reset to avoid getting stuck
+            return;
+        }
+
+        // 5. Send the packed notification
+        int rc = ble_gatts_notify_custom(conn_hdl, notify_handle, om);
+
+        if (rc != 0) {
+            ESP_LOGE("BLE_DEBUG", "Packed Notify Error: %d", rc);
+        } else {
+            // Optional: ESP_LOGI("BLE_DEBUG", "Sent 8 frames in 1 packet");
+        }
+
+        // 6. Reset offset to start filling the next packet
+        current_offset = 0;
+    }
+}
+
+void bleSendFWVersion() {
+    // [Start][LenH][LenL][Major][Minor][Patch][End] -> Wait, this is 7 bytes?
+    // Let's adjust to match your exact protocol requirements:
+    uint8_t response[] = {0xD0, 0x00, 0x06, 0x09, 0x02, 0xD1};
+    writeToPixelPoi(response);
+}
+
+//flexible timer
+// This function can be called anytime to change speed
+void update_timer_frequency(int hz) {
+    if (hz < 1) hz = 1;
+    current_period_us = 1000000 / hz;
+
+    esp_timer_stop(pov_timer);
+    esp_timer_start_periodic(pov_timer, current_period_us);
+
+    ESP_LOGI("TIMER", "Frequency set to %d Hz (%lu us)", hz, current_period_us);
+}
+
+//streaming timer
+void IRAM_ATTR pov_timer_callback(void* arg) {
+    if (frames_available > 0) {
+        // Pointer to the start of the current frame in the buffer
+        uint8_t *frame_ptr = &frame_queue[current_frame_idx * FRAME_SIZE];
+
+        for (int j = 0; j < PIXEL_COUNT; j++) {
+            int pixel_offset = j * 3;
+            uint8_t r = frame_ptr[pixel_offset + 0];
+            uint8_t g = frame_ptr[pixel_offset + 1];
+            uint8_t b = frame_ptr[pixel_offset + 2];
+
+            // Use your mirror mapping: MAX_LEDS - 1 - j
+            // This ensures the image isn't reversed or upside down
+            led_strip_set_pixel(led_strip, (PIXEL_COUNT - 1) - j, r, g, b);
+        }
+
+        // Flush to LEDs
+        led_strip_refresh(led_strip);
+
+        current_frame_idx++;
+        frames_available--;
+    }
+}
+
+void init_flexible_timer() {
+    const esp_timer_create_args_t timer_args = {
+        .callback = &pov_timer_callback,
+        .name = "pov_playback"
+    };
+    esp_timer_create(&timer_args, &pov_timer);
+}
+
+// MAIN
+void app_main(void) {
+    // 1. Minimum OS setup
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    //init spiffs
+    init_spiffs();
+
+    // 2. NIMBLE FIRST (Synchronous)
+    void check_memory(const char* label) {
+        multi_heap_info_t info;
+        heap_caps_get_info(&info, MALLOC_CAP_8BIT);
+        printf("--- Memory Check: %s ---\n", label);
+        printf("Total Free: %zu bytes\n", info.total_free_bytes);
+        printf("Largest Block: %zu bytes\n", info.largest_free_block); // <--- This is the key!
+        printf("Minimum Ever Free: %zu bytes\n", info.minimum_free_bytes);
+        printf("---------------------------\n");
+    }
+    check_memory("BEFORE_NIMBLE_INIT");
+    // Do NOT initialize LED strip or SPIFFS before this line
+    // 5. Start the NimBLE Host Task
+    ret = nimble_port_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE("BLE", "nimble_port_init failed: %d", ret);
+        return;
+    }
+    // 3. Configure Host
+    ble_hs_cfg.sync_cb = on_sync;
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ble_gatts_count_cfg(gatt_svr_svcs);
+    ble_gatts_add_svcs(gatt_svr_svcs);
+    // 2. Create the task manually with HIGH priority (e.g., 10 or 15)
+    // This ensures Bluetooth always wins over the LED math and Flash writes
+    xTaskCreate(host_task, "nimble_host", 8192, NULL, 15, NULL);
+
+    // 3. Start the port (this triggers the stack)
+
+    // 6. Hardware Init (Keep this AFTER BLE init to ensure heap availability)
+    gpio_set_direction(REGULATOR_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(REGULATOR_GPIO, 1);
+
+    // init queue
+    flash_queue = xQueueCreate(20, sizeof(flash_packet_t));
+    xTaskCreate(storage_worker_task, "storage_task", 6144, NULL, 4, NULL);
+    // --- NEW: Initialize LED Strip ---
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = LED_GPIO, // Ensure this matches your wiring (e.g., GPIO 8)
+        .max_leds = MAX_LEDS,            // The physical max of your strip
+    };
+    led_strip_rmt_config_t rmt_config = {
+        .resolution_hz = 10 * 1000 * 1000, // 10MHz for clean timing
+    };
+
+    // We use RMT because it's the most stable way to drive LEDs on C3
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+
+    ESP_LOGI(TAG, "LED Strip Initialized.");
+    // --- Button setup ---
+    gpio_config_t btn_conf = {
+        .pin_bit_mask = (1ULL << BOOT_BUTTON_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .intr_type = GPIO_INTR_ANYEDGE,
+    };
+    gpio_config(&btn_conf);
+
+    // 1. Install the service
+    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+
+    // 2. Use the NEW function name:
+    gpio_isr_handler_add(BOOT_BUTTON_PIN, button_isr_handler, NULL);
+    // --- Button setup end ---
+
+    //battery check
+    adc_oneshot_unit_init_cfg_t init_config1 = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+
+    adc_oneshot_chan_cfg_t config = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = ADC_ATTEN_DB_12, // Allows measuring up to ~3.1V on the pin
+    };
+    // Using GPIO 0 (ADC1 Channel 0)
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_0, &config));
+    ESP_LOGI(TAG, "Battery Check Initialized");
+    // init the buffer
+    ring_buf = calloc(1, sizeof(pov_stream_buf_t));
+    ring_buf->head = 0;
+    ring_buf->tail = 0;
+
+    // 7. Start the POV Rendering Task
+    // We give it a priority of 5 (Higher than the idle task, but balanced for BLE)
+    xTaskCreate(pov_render_task, "led_task", 10240, NULL, 10, &pov_task_handle);
+    //init stream timer
+
+    init_flexible_timer();
+
+    ESP_LOGI(TAG, "System Ready. Waiting for BLE Sync...");
+
+    // The main task can now just sit and watch the system or be deleted
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
