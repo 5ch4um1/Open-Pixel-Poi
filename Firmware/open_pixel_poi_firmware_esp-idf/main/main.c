@@ -46,6 +46,19 @@ uint16_t conn_hdl;
 uint8_t tx_buffer[512];
 uint16_t tx_len = 0;
 
+/* Define UUIDs as actual static variables first */
+static const ble_uuid128_t svc_uuid = 
+    BLE_UUID128_INIT(0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x01, 0x00, 0x40, 0x6E);
+
+static const ble_uuid128_t rx_uuid = 
+    BLE_UUID128_INIT(0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x02, 0x00, 0x40, 0x6E);
+
+static const ble_uuid128_t tx_uuid = 
+    BLE_UUID128_INIT(0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x03, 0x00, 0x40, 0x6E);
+
+static const ble_uuid128_t notify_uuid = 
+    BLE_UUID128_INIT(0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x04, 0x00, 0x40, 0x6E);
+
 //advertising forward declaration
 void start_advertising(void);
 void bleSendFWVersion(void);
@@ -97,8 +110,8 @@ void run_flash_animation(uint32_t color);
 
 
 // --- Hardware ---
-#define LED_GPIO            GPIO_NUM_4
-#define BUTTON_GPIO         GPIO_NUM_9
+#define LED_GPIO            GPIO_NUM_8
+#define BUTTON_GPIO         GPIO_NUM_3
 #define REGULATOR_GPIO      GPIO_NUM_7 
 #define MAX_LEDS            20
 
@@ -113,212 +126,31 @@ volatile bool led_task_paused = false; // To tell us it's safely stopped
 #define RING_BUF_SIZE (BYTES_PER_FRAME * FRAME_COUNT)
 
 //streaming
-bool g_request_blackout_val = false;
-// Sub-frame field offsets (relative to asm_buf[0] == 0xD0)
-#define OFF_TYPE        1   // 0x0D
-#define OFF_VER         2
-#define OFF_LED_H       3
-#define OFF_LED_W       4
-#define OFF_PAYLEN_H    5
-#define OFF_PAYLEN_L    6
-#define OFF_SEQ_H       7
-#define OFF_SEQ_L       8
-#define OFF_CRC32       9   // 9..12 (big-endian)
-#define OFF_PAYLOAD     13  // start of payload
+#define PIXEL_COUNT 20
+#define MAX_FRAMES 928
+#define FRAME_SIZE (PIXEL_COUNT * 3)
+#define FRAME_SIZE (PIXEL_COUNT * 3)   // 60 bytes
+#define FRAMES_PER_PACKET 8              // How many frames to pack
+#define TOTAL_DATA_LEN (FRAME_SIZE * FRAMES_PER_PACKET) // 480 bytes
+static uint8_t packed_buffer[TOTAL_DATA_LEN];
+static uint16_t current_offset = 0;
+static uint8_t frame_queue[TOTAL_DATA_LEN * 2]; 
+volatile int frames_available = 0;
+static int current_frame_idx = 0;
 
-static int find_subframe_start(const uint8_t *d, int n) {
-    // Look for 0xD0 0x0D anywhere in this chunk
-    for (int i = 0; i + 1 < n; i++) {
-        if (d[i] == 0xD0 && d[i+1] == 0x0D) return i;
-    }
-    return -1;
-}
+typedef struct {
+    uint8_t frames[MAX_FRAMES][FRAME_SIZE]; // 928 * 60 bytes
+    volatile uint16_t head;
+    volatile uint16_t tail;
+    uint32_t total_played; // <--- Add this for global tracking
+    bool is_streaming;
+} pov_stream_buf_t;
 
-//streaming packet format
-static struct {
-    uint16_t led_h;       // negotiated frame height (<= MAX_LEDS)
-    uint16_t payload_len; // led_h * 3
-    uint16_t mtu;         // current GATT MTU (optional)
-    uint16_t last_seq;    // last accepted frame sequence
-    bool     active;
-} g_stream_cfg = {
-    .led_h = MAX_LEDS,
-    .payload_len = MAX_LEDS * 3,
-    .mtu = 0,
-    .last_seq = 0,
-    .active = false,
-};
+static pov_stream_buf_t *ring_buf = NULL;
+static TaskHandle_t pov_task_handle = NULL;
+static esp_timer_handle_t pov_timer;
+uint32_t current_period_us = 5000; // Default 200Hz (1/200s = 5000us)
 
-
-bool g_is_streaming = false;
-uint64_t g_last_stream_time = 0;
-bool g_is_refreshing = false;
-
-
-//streaming buffer
-
-#define STREAM_MAX_H      144            // upper bound (protect heap)
-#define STREAM_MAX_PAYLOAD (STREAM_MAX_H * 3)
-#define STREAM_MAX_FRAME   (32 /*hdr*/ + STREAM_MAX_PAYLOAD + 1 /*footer*/)
-
-typedef enum { ASM_IDLE, ASM_HEADER, ASM_PAYLOAD, ASM_FOOTER } asm_state_t;
-
-static asm_state_t asm_state = ASM_IDLE;
-static uint8_t     asm_buf[STREAM_MAX_FRAME];
-static uint16_t    asm_pos = 0;
-static uint16_t    asm_expected = 0;     // total frame size we expect
-static uint16_t    asm_payload_len = 0;
-static uint16_t    asm_seq = 0;
-
-static void asm_reset(void) {
-    asm_state = ASM_IDLE;
-    asm_pos = 0;
-    asm_expected = 0;
-    asm_payload_len = 0;
-    asm_seq = 0;
-}
-//streaming ringbuffer 
-// sizes driven by negotiated payload_len (g_stream_cfg.payload_len)
-#define FRAME_COUNT        42
-static uint8_t  g_ring_buffer[STREAM_MAX_PAYLOAD * FRAME_COUNT];
-static uint32_t g_write_idx = 0;
-static uint32_t g_read_idx  = 0;
-
-// push one assembled frame payload into ring
-static void push_frame_to_ring(const uint8_t *payload, uint16_t len, uint16_t seq) {
-    // Drop duplicates/out-of-order
-    if ((uint16_t)(seq - g_stream_cfg.last_seq) == 0) return;  // duplicate
-    g_stream_cfg.last_seq = seq;
-
-    // If len != current payload_len (sender changed height), adapt on the fly
-    g_stream_cfg.payload_len = len;
-
-    // Wrap-safe copy
-    uint32_t cap = STREAM_MAX_PAYLOAD * FRAME_COUNT;
-    uint32_t end = g_write_idx + len;
-    if (end <= cap) {
-        memcpy(&g_ring_buffer[g_write_idx], payload, len);
-    } else {
-        uint32_t first = cap - g_write_idx;
-        memcpy(&g_ring_buffer[g_write_idx], payload, first);
-        memcpy(&g_ring_buffer[0],        payload + first, len - first);
-    }
-    g_write_idx = (g_write_idx + len) % cap;
-}
-
-
-// feed fragments from GATT write (any size)
-
-// Sub-frame field offsets (relative to asm_buf[0] == 0xD0)
-#define OFF_TYPE        1   // 0x0D
-#define OFF_VER         2
-#define OFF_LED_H       3
-#define OFF_LED_W       4
-#define OFF_PAYLEN_H    5
-#define OFF_PAYLEN_L    6
-#define OFF_SEQ_H       7
-#define OFF_SEQ_L       8
-#define OFF_CRC32       9   // 9..12 (big-endian)
-#define OFF_PAYLOAD     13  // start of payload
-
-static void asm_reset(void);            // your existing reset
-static uint32_t crc32_ieee(const uint8_t *data, size_t len); // if you enabled CRC
-
-static bool asm_feed(const uint8_t *frag, uint16_t frag_len)
-{
-    // Cap to buffer to avoid overflow
-    if (frag_len > (STREAM_MAX_FRAME - asm_pos)) {
-        frag_len = STREAM_MAX_FRAME - asm_pos;
-    }
-    if (frag_len > 0) {
-        memcpy(&asm_buf[asm_pos], frag, frag_len);
-        asm_pos += frag_len;
-    }
-
-    // --- STATE: sync on sub-frame start D0 0D ---
-    if (asm_state == ASM_IDLE) {
-        if (asm_pos < 2) return false; // need at least D0 0D candidates
-
-        // Find the first occurrence of D0 0D in the accumulated buffer
-        int s = -1;
-        for (int i = 0; i + 1 < asm_pos; ++i) {
-            if (asm_buf[i] == 0xD0 && asm_buf[i + 1] == 0x0D) { s = i; break; }
-        }
-        if (s < 0) {
-            // Keep one byte to help find D0 on next feed
-            asm_buf[0] = asm_buf[asm_pos - 1];
-            asm_pos = 1;
-            return false;
-        }
-        // Shift so sub-frame begins at asm_buf[0]
-        if (s > 0) {
-            memmove(asm_buf, &asm_buf[s], asm_pos - s);
-            asm_pos -= s;
-        }
-        asm_state = ASM_HEADER;
-    }
-
-    // --- STATE: header parsing ---
-    if (asm_state == ASM_HEADER) {
-        // Need the full fixed header: D0 + Type..Seq + CRC32 (13 bytes total)
-        if (asm_pos < OFF_PAYLOAD) return false;
-
-        uint8_t  ver         = asm_buf[OFF_VER];
-        uint8_t  led_h       = asm_buf[OFF_LED_H];
-        uint16_t payload_len = ((uint16_t)asm_buf[OFF_PAYLEN_H] << 8) | asm_buf[OFF_PAYLEN_L];
-        asm_seq              = ((uint16_t)asm_buf[OFF_SEQ_H]    << 8) | asm_buf[OFF_SEQ_L];
-
-        // Big-endian CRC32 stored at OFF_CRC32
-        uint32_t crc_be = ((uint32_t)asm_buf[OFF_CRC32 + 0] << 24) |
-                          ((uint32_t)asm_buf[OFF_CRC32 + 1] << 16) |
-                          ((uint32_t)asm_buf[OFF_CRC32 + 2] <<  8) |
-                          (uint32_t)asm_buf[OFF_CRC32 + 3];
-
-        // Sanity checks
-        if (ver != 0x01) { asm_reset(); return false; }
-        if (led_h == 0 || led_h > STREAM_MAX_H) { asm_reset(); return false; }
-        if (payload_len != (uint16_t)led_h * 3 || payload_len > STREAM_MAX_PAYLOAD) {
-            asm_reset(); return false;
-        }
-
-        asm_payload_len = payload_len;
-        // Expected bytes for the complete sub-frame = header (OFF_PAYLOAD) + payload + 1-byte footer
-        asm_expected    = OFF_PAYLOAD + asm_payload_len + 1;
-        asm_state       = ASM_PAYLOAD;
-    }
-
-    // --- STATE: accumulate payload (+footer) ---
-    if (asm_state == ASM_PAYLOAD) {
-        if (asm_pos < asm_expected) return false; // frame not complete yet
-
-        // Footer check: last byte of sub-frame must be 0xD1
-        if (asm_buf[asm_expected - 1] != 0xD1) {
-            asm_reset();
-            return false;
-        }
-
-        // Optional CRC32 verification over [Type..Seq] + payload
-        // Coverage length = (OFF_PAYLOAD - OFF_TYPE) header w/o CRC + payload_len
-        //   OFF_PAYLOAD - OFF_TYPE == 12 bytes (Type, Ver, H, W, LenH, LenL, SeqH, SeqL)
-        /*
-        size_t crc_region_len = (OFF_PAYLOAD - OFF_TYPE) + asm_payload_len;
-        uint32_t crc_calc = crc32_ieee(&asm_buf[OFF_TYPE], crc_region_len);
-        if (crc_calc != crc_be) {
-            asm_reset();
-            return false;
-        }
-        */
-
-        // Full frame ready
-        asm_state = ASM_FOOTER;
-    }
-
-    if (asm_state == ASM_FOOTER) {
-        return true;
-    }
-
-    return false;
-}
 
 
 
@@ -516,13 +348,7 @@ void default_rainbow_pattern() {
     led_strip_refresh(led_strip);
     // Note: We don't vTaskDelay here because we are inside the task loop
 }
-//blackout all leds
 
-void g_request_blackout() {
-    for (int i = 0; i < MAX_LEDS; i++) { led_strip_set_pixel(led_strip, i, 0, 0, 0); }
-    led_strip_refresh(led_strip);
-    g_request_blackout_val = false;
-}
         
 // LEDS POV render task
 void pov_render_task(void *pvParameters) {
@@ -569,7 +395,6 @@ if (g_btn_is_down) {
     // 3. Action Trigger (1s after last release)
     if (g_in_menu_mode && (current_tick - g_last_release_tick) > pdMS_TO_TICKS(1000)) {
         if (g_short_press_count == 1) {
-            g_is_streaming = !g_is_streaming;
             run_flash_animation(0x00FF00); // Green for stream toggle
         } else if (g_short_press_count == 2) {
             g_current_bank = (g_current_bank + 1) % 3;
@@ -585,11 +410,12 @@ if (g_btn_is_down) {
 }
 
 //button end
+
 		
        //check if we should do anything at all
        if (!led_task_running) {
             led_task_paused = true;
-            led_strip_clear(led_strip);
+            
             vTaskDelay(pdMS_TO_TICKS(100)); // Sleep until upload finishes
             continue;
         }
@@ -608,69 +434,6 @@ if (g_btn_is_down) {
             continue;
         }
           
-
-// --- streaming section start (REPLACE your if(g_is_streaming) block) ---
-if (g_stream_cfg.active) {
-    uint64_t now = esp_timer_get_time() / 1000ULL;
-
-    // Watchdog: stop streaming after 2s without incoming frames
-    if ((now - g_last_stream_time) > 2000ULL) {
-        g_stream_cfg.active = false;
-        ESP_LOGW("WATCHDOG", "Stream Timeout");
-        // Optional cleanup:
-        // g_read_idx = g_write_idx = 0;
-        // led_strip_clear(led_strip); led_strip_refresh(led_strip);
-    }
-    else if (g_read_idx != g_write_idx) {
-        // If you have a file/pattern fallback elsewhere, close it here. If not, you can remove this.
-        if (f) { fclose(f); f = NULL; }
-
-        uint16_t L      = g_stream_cfg.payload_len;   // bytes per frame
-        uint16_t led_h  = g_stream_cfg.led_h;         // logical LEDs (<= MAX_LEDS)
-        float    scale  = g_brightness / 255.0f;
-        uint32_t cap    = STREAM_MAX_PAYLOAD * FRAME_COUNT;
-        uint32_t base   = g_read_idx;
-
-        // Guard: payload must be sane and aligned
-        if (L == 0 || (L % 3) != 0 || L > STREAM_MAX_PAYLOAD) {
-            ESP_LOGW("STREAM", "Bad frame L=%u; skipping", L);
-            // Skip one frame's worth to resync
-            g_read_idx = (g_read_idx + (L ? L : 3)) % cap;
-        } else {
-            int logical_leds = (int)(L / 3);
-            if (led_h > 0 && led_h < logical_leds) logical_leds = led_h;
-            if (logical_leds > MAX_LEDS) logical_leds = MAX_LEDS;
-
-            for (int j = 0; j < logical_leds; j++) {
-                // Compute byte offset with wrap for R,G,B
-                uint32_t offR = (base + (uint32_t)j * 3U) % cap;
-                uint32_t offG = (offR + 1U) % cap;
-                uint32_t offB = (offR + 2U) % cap;
-
-                uint8_t r = (uint8_t)(g_ring_buffer[offR] * scale);
-                uint8_t g = (uint8_t)(g_ring_buffer[offG] * scale);
-                uint8_t b = (uint8_t)(g_ring_buffer[offB] * scale);
-
-                // Invert mapping across physical strip (mirror); change to `int phys = j;` if not desired
-                int phys = MAX_LEDS - 1 - j;
-                if ((unsigned)phys < MAX_LEDS) {
-                    led_strip_set_pixel(led_strip, phys, r, g, b);
-                }
-            }
-
-            led_strip_refresh(led_strip);
-            // Consume exactly one frame
-            g_read_idx = (g_read_idx + L) % cap;
-        }
-    }
-
-    // Fixed high-speed delay for streaming
-    vTaskDelay(pdMS_TO_TICKS(5));
-    continue; // <-- Skip all file/pattern code below while streaming
-}
-// --- streaming section end ---
-
-        
    		//check battery
 		static TickType_t last_battery_tick = 0;
          current_tick = xTaskGetTickCount();
@@ -816,9 +579,13 @@ static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
             conn_hdl = 0xFFFF;
             // Safety: Reset multipart flag so we don't stay in "Loading" state
             g_multipart_active = false;
+
+            // AUTO-RECOVERY: Start advertising, stop the pov_timer and enter the render loop again
+            led_task_running = true;
+            esp_timer_stop(pov_timer);
+            frames_available = 0;
+            start_advertising();
             
-            // AUTO-RECOVERY: Start advertising again
-            start_advertising(); 
             return 0;
 
         case BLE_GAP_EVENT_MTU:
@@ -924,7 +691,9 @@ typedef enum {
     CC_SET_SPEED_OPTIONS = 19,
     CC_SET_PATTERN_SHUFFLE_DURATION = 20,
     CC_START_STREAM = 21,
-    CC_STOP_STREAM = 22
+    CC_STOP_STREAM = 22,
+    CC_GET_CONFIG = 23,
+    CC_STREAM_DATA = 24
 } poi_comm_code_t;
 
 // multi part upload
@@ -1031,6 +800,47 @@ if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
 
 							// Handle standard commands
 							switch (code) {
+								
+	case CC_GET_CONFIG:
+    ESP_LOGI("BLE", "Config request received");
+
+    // 1. Prepare the response structure (Big Endian)
+    // Packet: [Header, Code, PixelCount, Flags, Buf_H, Buf_L, FPS_H, FPS_L, Ver_H, Ver_L]
+    uint8_t config_resp[10];
+    config_resp[0] = 0xD0;
+    config_resp[1] = CC_GET_CONFIG;
+    config_resp[2] = (uint8_t)MAX_LEDS; // Ensure this is defined (e.g., 20)
+    config_resp[3] = 0x01;                 // Flag 0x01: GRB color order
+    
+    // Buffer size (e.g., 928 frames)
+    config_resp[4] = (uint8_t)((928 >> 8) & 0xFF); 
+    config_resp[5] = (uint8_t)(928 & 0xFF);
+    
+    // FPS (e.g., 200)
+    config_resp[6] = (uint8_t)((200 >> 8) & 0xFF);
+    config_resp[7] = (uint8_t)(200 & 0xFF);
+    
+    // Firmware Version (e.g., 1)
+    config_resp[8] = 0x01;
+    config_resp[9] = 0xA4;
+
+    // 2. Allocate mbuf and send via the Notify Handle
+    // We use ble_gatt_server_send_notify (standard) or indicate
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(config_resp, sizeof(config_resp));
+    if (om != NULL) {
+        // notify_handle is the val_handle from your NOTIFY_UUID definition
+        int rc = ble_gattc_notify_custom(conn_handle, notify_handle, om);
+        if (rc != 0) {
+            ESP_LOGE("BLE", "Error sending config notification; rc=%d", rc);
+        } else {
+            ESP_LOGI("BLE", "Config notification sent");
+        }
+    } else {
+        ESP_LOGE("BLE", "Failed to allocate mbuf for config response");
+    }
+    break;
+								
+								
 								case CC_SET_BRIGHTNESS:
 									ESP_LOG_BUFFER_HEX("BLE_SPEED_RAW", data, len);
 									if (payload_len >= 1) g_brightness = payload[0];
@@ -1065,55 +875,71 @@ if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
 
 
 case CC_START_STREAM: {
-    // Look for the sub-frame header in this chunk
-    int start = find_subframe_start(data, len);
-    if (start < 0) {
-        // This chunk might be only [D0, 21] (command prefix) or partial data; wait for next chunk.
-        break;
+    // We expect 3 bytes: [Command, Hz_High, Hz_Low]
+    // If Python sends 500Hz, bytes are [0x01, 0x01, 0xF4]
+    uint16_t requested_hz = 200; // Default fallback
+    led_task_running = false;
+    if (len >= 3) {
+        requested_hz = (data[1] << 8) | data[2];
     }
 
-    // Feed only the sub-frame bytes into the assembler
-    if (!asm_feed(&data[start], len - start)) {
-        break; // not complete yet
+    if (requested_hz > 0) {
+        uint64_t period_us = 1000000 / requested_hz;
+        
+        // Safety: Stop timer if it was already running before re-configuring
+        esp_timer_stop(pov_timer); 
+        
+        // Reset our playback counters for the new stream
+        frames_available = 0;
+        current_frame_idx = 0;
+        
+        // Start hardware timer at the new flexible interval
+        esp_timer_start_periodic(pov_timer, period_us);
+        
+        ESP_LOGI("BLE", "Stream Started: Frequency set to %u Hz (%llu us)", requested_hz, period_us);
     }
-
-    // Full sub-frame assembled: parse and verify
-    uint8_t  led_h       = asm_buf[OFF_LED_H];
-    uint16_t payload_len = ((uint16_t)asm_buf[OFF_PAYLEN_H] << 8) | asm_buf[OFF_PAYLEN_L];
-    uint16_t seq         = ((uint16_t)asm_buf[OFF_SEQ_H]    << 8) | asm_buf[OFF_SEQ_L];
-
-    int footer_idx = OFF_PAYLOAD + payload_len;
-    uint8_t footer = asm_buf[footer_idx];
-    if (footer != 0xD1) {
-        ESP_LOGE("STREAM", "Footer mismatch at %d (got %02X)", footer_idx, footer);
-        asm_reset();
-        break;
-    }
-
-    // (Optional) CRC32 check here if enabled
-
-    g_stream_cfg.led_h       = (led_h <= MAX_LEDS) ? led_h : MAX_LEDS;
-    g_stream_cfg.payload_len = payload_len;
-    g_stream_cfg.active      = true;
-    g_last_stream_time       = esp_timer_get_time() / 1000;
-
-    const uint8_t *payload = &asm_buf[OFF_PAYLOAD];
-    push_frame_to_ring(payload, payload_len, seq);
-
-    asm_reset();
     break;
 }
 
+case CC_STOP_STREAM: {
+    // Halt the timer immediately
+    esp_timer_stop(pov_timer);
+    led_task_running = true;
+    // Clear playback state
+    frames_available = 0;
+    current_frame_idx = 0;
 
-
-
-case CC_STOP_STREAM:
-    g_stream_cfg.active = false;
-    g_read_idx = g_write_idx = 0;
-    g_request_blackout_val = true;
-    asm_reset();
-    ESP_LOGI("BLE", "Stream Stopped & Buffer Reset");
+    // Clear the physical LEDs so they don't stay "stuck" on
+    if (led_strip) {
+        led_strip_clear(led_strip);
+        led_strip_refresh(led_strip);
+    }
+    
+    ESP_LOGI("BLE", "Stream Stopped: Timer halted and LEDs cleared");
     break;
+}
+
+case CC_STREAM_DATA: {
+    // Temporary buffer to hold the 1 byte command + 480 bytes data
+    uint8_t temp_flat_buf[482];
+    uint16_t actual_len;
+    led_task_running = false;
+    // This function pulls the data out of the potentially fragmented mbuf 'om'
+    int rc = ble_hs_mbuf_to_flat(ctxt->om, temp_flat_buf, sizeof(temp_flat_buf), &actual_len);
+
+    if (rc == 0 && actual_len >= 482) {
+        // temp_flat_buf[0] is the CC_STREAM_DATA command
+        // Copy the 480 bytes starting from index 1
+        memcpy(frame_queue, &temp_flat_buf[2], TOTAL_DATA_LEN);
+        
+        // Reset our playback pointers
+        current_frame_idx = 0;
+        frames_available = FRAMES_PER_PACKET; // Set to 8
+    } else {
+        ESP_LOGE("BLE", "Failed to flatten mbuf or length mismatch: %d, len: %d", rc, actual_len);
+    }
+    break;
+}
 
 								
 								case CC_SET_SPEED_OPTION:
@@ -1258,55 +1084,39 @@ case CC_STOP_STREAM:
 					return 0;
 				}
 
-static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
-{
-        .type = BLE_GATT_SVC_TYPE_PRIMARY,
-        // SERVICE_UUID: 6e400001-b5a3-f393-e0a9-e50e24dcca9e
-        .uuid = BLE_UUID128_DECLARE(0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x01, 0x00, 0x40, 0x6E),
-        .characteristics = (struct ble_gatt_chr_def[]) {
-            {
-                // RX_UUID: 6e400002...
-                .uuid = BLE_UUID128_DECLARE(0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x02, 0x00, 0x40, 0x6E),
-                .access_cb = gatt_svr_cb,
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
-                .descriptors = (struct ble_gatt_dsc_def[]) { {
-                    .uuid = BLE_UUID16_DECLARE(0x2901), // User Description Descriptor
-                    .att_flags = BLE_ATT_F_READ,
-                    .access_cb = gatt_svr_cb,
-                    .arg = "RX Characteristic",
-                }, {0} }
-            },
-            {
-                // TX_UUID: 6e400003...
-                .uuid = BLE_UUID128_DECLARE(0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x03, 0x00, 0x40, 0x6E),
-                .access_cb = gatt_svr_cb,
-                .flags = BLE_GATT_CHR_F_READ,
-                .descriptors = (struct ble_gatt_dsc_def[]) { {
-                    .uuid = BLE_UUID16_DECLARE(0x2901),
-                    .att_flags = BLE_ATT_F_READ,
-                    .access_cb = gatt_svr_cb,
-                    .arg = "TX Characteristic",
-                }, {0} }
-            },
-            {
-                // NOTIFY_UUID: 6e400004...
-                .uuid = BLE_UUID128_DECLARE(0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x04, 0x00, 0x40, 0x6E),
-                .access_cb = gatt_svr_cb,
-                .flags = BLE_GATT_CHR_F_NOTIFY,
-                .val_handle = &notify_handle,
-                .descriptors = (struct ble_gatt_dsc_def[]) { {
-                    .uuid = BLE_UUID16_DECLARE(0x2901),
-                    .att_flags = BLE_ATT_F_READ,
-                    .access_cb = gatt_svr_cb,
-                    .arg = "Notify Characteristic",
-                },
-                
-                 {0} }
-            },
-            {0}
-        },
+
+/* 1. Define Characteristics Array First */
+static const struct ble_gatt_chr_def gatt_characteristics[] = {
+    {
+        // RX Characteristic
+        .uuid = (ble_uuid_t *)&rx_uuid,
+        .access_cb = gatt_svr_cb,
+        .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
     },
-    {0},
+    {
+        // TX Characteristic
+        .uuid = (ble_uuid_t *)&tx_uuid,
+        .access_cb = gatt_svr_cb,
+        .flags = BLE_GATT_CHR_F_READ,
+    },
+    {
+        // NOTIFY Characteristic
+        .uuid = (ble_uuid_t *)&notify_uuid,
+        .access_cb = gatt_svr_cb,
+        .flags = BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &notify_handle,
+    },
+    {0} // Terminator
+};
+
+/* 2. Define the Service Table pointing to the array above */
+static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = (ble_uuid_t *)&svc_uuid,
+        .characteristics = gatt_characteristics, // Point to the named array
+    },
+    {0}, // Terminator
 };
 
 void host_task(void *param) {
@@ -1320,45 +1130,42 @@ void host_task(void *param) {
 }
 //BLE functions
 void writeToPixelPoi(uint8_t* data) {
-    uint16_t len = (data[1] << 8) | data[2];
-    
-    // 1. Check if we even have a connection
-    if (conn_hdl == 65535) {
-        ESP_LOGE("BLE_DEBUG", "Notify failed: No active connection handle!");
+    // 1. Data Validation: Incoming 'data' is 60 bytes of RGB
+    // (Assuming the caller stripped the old headers or adjusted length)
+    uint16_t incoming_len = 60; 
+
+    // 2. Safety Check: Handle & Connection
+    if (conn_hdl == 65535 || notify_handle == 0) {
         return;
     }
 
-    // 2. Check if the Notify Handle was actually captured during boot
-    if (notify_handle == 0) {
-        ESP_LOGE("BLE_DEBUG", "Notify failed: notify_handle is 0. Check GATT registration.");
-        return;
-    }
+    // 3. PACKING LOGIC: Copy incoming frame into our "Big Box"
+    memcpy(&packed_buffer[current_offset], data, incoming_len);
+    current_offset += incoming_len;
 
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
-    if (!om) {
-        ESP_LOGE("BLE_DEBUG", "Notify failed: Could not allocate mbuf (Memory full?)");
-        return;
-    }
-
-    // 3. Perform the notify and capture the specific NimBLE error
-    int rc = ble_gatts_notify_custom(conn_hdl, notify_handle, om);
-    
-    if (rc != 0) {
-        switch (rc) {
-            case 6: // BLE_HS_EDISABLED
-                ESP_LOGE("BLE_DEBUG", "RC 6: Phone has NOT subscribed to notifications (CCCD is 0)!");
-                break;
-            case 2: // BLE_HS_ENOTCONN
-                ESP_LOGE("BLE_DEBUG", "RC 2: Stack thinks we are disconnected.");
-                break;
-            case 13: // BLE_HS_EINVAL
-                ESP_LOGE("BLE_DEBUG", "RC 13: Invalid handle (%d) or length (%d).", notify_handle, len);
-                break;
-            default:
-                ESP_LOGE("BLE_DEBUG", "Notify failed with RC: %d", rc);
+    // 4. Check if the "Big Box" is full (8 frames = 480 bytes)
+    if (current_offset >= TOTAL_DATA_LEN) {
+        
+        // Convert the flat packed buffer into an mbuf for NimBLE
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(packed_buffer, TOTAL_DATA_LEN);
+        
+        if (!om) {
+            ESP_LOGE("BLE_DEBUG", "Mbuf allocation failed!");
+            current_offset = 0; // Reset to avoid getting stuck
+            return;
         }
-    } else {
-        ESP_LOGI("BLE_DEBUG", "Notification sent successfully to handle %d", notify_handle);
+
+        // 5. Send the packed notification
+        int rc = ble_gatts_notify_custom(conn_hdl, notify_handle, om);
+        
+        if (rc != 0) {
+            ESP_LOGE("BLE_DEBUG", "Packed Notify Error: %d", rc);
+        } else {
+            // Optional: ESP_LOGI("BLE_DEBUG", "Sent 8 frames in 1 packet");
+        }
+
+        // 6. Reset offset to start filling the next packet
+        current_offset = 0;
     }
 }
 
@@ -1367,6 +1174,53 @@ void bleSendFWVersion() {
     // Let's adjust to match your exact protocol requirements:
     uint8_t response[] = {0xD0, 0x00, 0x06, 0x09, 0x02, 0xD1}; 
     writeToPixelPoi(response);
+}
+
+//flexible timer
+// This function can be called anytime to change speed
+void update_timer_frequency(int hz) {
+    if (hz < 1) hz = 1;
+    current_period_us = 1000000 / hz;
+
+    esp_timer_stop(pov_timer);
+    esp_timer_start_periodic(pov_timer, current_period_us);
+    
+    ESP_LOGI("TIMER", "Frequency set to %d Hz (%lu us)", hz, current_period_us);
+}
+
+
+//streaming timer
+void IRAM_ATTR pov_timer_callback(void* arg) {
+    if (frames_available > 0) {
+        // Pointer to the start of the current frame in the buffer
+        uint8_t *frame_ptr = &frame_queue[current_frame_idx * FRAME_SIZE];
+
+for (int j = 0; j < PIXEL_COUNT; j++) {
+            int pixel_offset = j * 3;
+            uint8_t r = frame_ptr[pixel_offset + 0];
+            uint8_t g = frame_ptr[pixel_offset + 1];
+            uint8_t b = frame_ptr[pixel_offset + 2];
+
+            // Use your mirror mapping: MAX_LEDS - 1 - j
+            // This ensures the image isn't reversed or upside down
+            led_strip_set_pixel(led_strip, (PIXEL_COUNT - 1) - j, r, g, b);
+        }
+
+        // Flush to LEDs
+        led_strip_refresh(led_strip);
+
+        current_frame_idx++;
+        frames_available--;
+    }
+}
+
+void init_flexible_timer() {
+    const esp_timer_create_args_t timer_args = {
+        .callback = &pov_timer_callback,
+        .name = "pov_playback"
+    };
+    esp_timer_create(&timer_args, &pov_timer);
+    
 }
 
 // MAIN
@@ -1468,9 +1322,19 @@ gpio_isr_handler_add(BOOT_BUTTON_PIN, button_isr_handler, NULL);
 						// Using GPIO 0 (ADC1 Channel 0)
 						ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_0, &config));
 ESP_LOGI(TAG, "Battery Check Initialized");
+// init the buffer
+ring_buf = calloc(1, sizeof(pov_stream_buf_t));
+ring_buf->head = 0;
+ring_buf->tail = 0;
+
     // 7. Start the POV Rendering Task
     // We give it a priority of 5 (Higher than the idle task, but balanced for BLE)
-    xTaskCreate(pov_render_task, "led_task", 10240, NULL, 5, NULL);
+    xTaskCreate(pov_render_task, "led_task", 10240, NULL, 10, &pov_task_handle);
+//init stream timer
+
+
+init_flexible_timer();
+
 
     ESP_LOGI(TAG, "System Ready. Waiting for BLE Sync...");
     
