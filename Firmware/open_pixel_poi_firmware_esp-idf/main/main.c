@@ -41,8 +41,10 @@ uint8_t g_brightness = 10;
 
 
 typedef struct {
-    uint8_t pkt_data[512]; // Buffer large enough for MTU
+    uint8_t pkt_data[512];
     uint16_t len;
+    bool is_final;      // NEW: Explicitly marks the end
+    uint8_t skip_bytes; // NEW: To skip the 5-byte header in packet #1
 } flash_packet_t;
 
 QueueHandle_t flash_queue = NULL;
@@ -761,29 +763,31 @@ void storage_worker_task(void *pvParameters) {
                 ESP_LOGI("STORAGE", "Opening new file: %s", path);
             }
 
-            if (f) {
-                // Check if this packet contains the terminator 0xD1
-                bool is_last = (pkt.pkt_data[pkt.len - 1] == 0xD1);
-                size_t write_len = is_last ? pkt.len - 1 : pkt.len;
+if (f) {
+    // 1. Calculate how much real data to write
+    // Skip the header if it's the first packet
+    // Subtract 1 from length if it's the final packet (removing the 0xD1 terminator)
+    int start_offset = pkt.skip_bytes;
+    int data_to_write = pkt.is_final ? (pkt.len - 1) : pkt.len;
+    int final_write_len = data_to_write - start_offset;
 
-                fwrite(pkt.pkt_data, 1, write_len, f);
+    if (final_write_len > 0) {
+        fwrite(pkt.pkt_data + start_offset, 1, final_write_len, f);
+    }
 
-                if (is_last) {
-                    fflush(f);
-                    fsync(fileno(f));
-                    fclose(f);
-                    f = NULL; // Reset for next time
-
-                    vTaskDelay(pdMS_TO_TICKS(100)); // Flash cool-down
-
-                    g_multipart_active = false;
-                    led_task_running = true;
-                    ESP_LOGI("BLE", "LED Task Resumed");
-
-                    g_reloading_pattern = true;     // Tell LED task to load new file
-                    ESP_LOGI("STORAGE", "Upload finished and saved.");
-                }
-            }
+    // 2. Only close when the flag tells us to
+    if (pkt.is_final) {
+        fflush(f);
+        fsync(fileno(f));
+        fclose(f);
+        f = NULL;
+        
+        g_multipart_active = false;
+        led_task_running = true;
+        g_reloading_pattern = true; 
+        ESP_LOGI("STORAGE", "Upload saved successfully.");
+    }
+}
         }
     }
 }
@@ -1037,21 +1041,30 @@ break;
                 }
                 break;
 
-            case CC_SET_PATTERN:
-                ESP_LOGI("BLE", "Pattern Upload Started - Sending to Queue");
-                g_multipart_active = true;
-                led_task_running = false;
-                while (!led_task_paused) { vTaskDelay(1); }
-                ESP_LOGI("BLE", "LED Task safely parked for upload");
-                // Optional: Turn off LEDs so they don't stay stuck on one color
-                led_strip_clear(led_strip);
+            case CC_SET_PATTERN: 
+    
+    
+    flash_packet_t pkt = {0};
+    pkt.len = payload_len;
+    
+    // Logic from the original code: If less than full MTU, it's the end
+    pkt.is_final = (payload_len < 509); 
+    
+    // If this is the start (contains 0xD0 and CC_SET_PATTERN)
+    if (payload_len >= 5 && payload[0] == 0xD0 && payload[1] == CC_SET_PATTERN) {
+        pkt.skip_bytes = 5; 
+        g_multipart_active = true;
+        led_task_running = false; // Park the LEDs
+    } else {
+        pkt.skip_bytes = 0;
+    }
 
-                // SHIP TO QUEUE
-                flash_packet_t pkt;
-                pkt.len = payload_len;
-                memcpy(pkt.pkt_data, payload, payload_len);
-                xQueueSend(flash_queue, &pkt, portMAX_DELAY);
-                break;
+    memcpy(pkt.pkt_data, payload, payload_len);
+    xQueueSend(flash_queue, &pkt, portMAX_DELAY);
+
+     // Reset state for next upload
+    break;
+
 
             case CC_GET_FW_VERSION:
                 ESP_LOGI("BLE", "Firmware version requested, sending direct response...");
