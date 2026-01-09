@@ -25,4 +25,5 @@ Build with ```idf.py build``` flash with ```idf.py flash``` and check debug mess
 
 In case you missed all the other warnigns above: **Do NOT use the esp-idf firmware unless you really know what you are doing.**
 
-Experimental web app to test the streaming mode: https://5ch4um1.es/oppstream.html 
+Experimental web app to test the streaming mode: https://5ch4um1.es/oppstream3.html
+Not sure if I already warned you, but the streaming mode sends raw pixel data to the poi, if you send FF FF FF, that's very bright and it might crash or fry your poi, the web app should be capped at 30% brightness for safety reasons, but it has not been thoroughly tested yet.
