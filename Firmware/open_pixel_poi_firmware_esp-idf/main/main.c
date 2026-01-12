@@ -26,16 +26,17 @@
 static size_t storage_total = 0;
 static size_t storage_used = 0;
 static uint32_t free_space_kb = 0;
+uint8_t file_h = 0; // The real height from the file
 //queue
 #include "freertos/queue.h"
 
 // --- Hardware ---
-#define LED_GPIO            GPIO_NUM_4
+#define LED_GPIO            GPIO_NUM_2
 #define BUTTON_GPIO         GPIO_NUM_9
 #define REGULATOR_GPIO      GPIO_NUM_7
-#define MAX_LEDS            24
+#define MAX_LEDS            20
 #define BATTERY_SCALING_FACTOR 3.08f
-#define adcchan ADC_CHANNEL_0
+#define adcchan ADC_CHANNEL_4
 // This is the actual value used in your LED loop on startup (updated via the index)
 uint8_t g_brightness = 10;
 
@@ -78,12 +79,12 @@ static const ble_uuid128_t notify_uuid =
 //advertising forward declaration
 void start_advertising(void);
 void bleSendFWVersion(void);
-static const char *TAG = "Pixel Poi";
+static const char *TAG = "Open Pixel Poi";
 
 // speeds
 // Predefined speed presets (delay calculations will use these)
 // 0 = slowest, 255 = fastest
-uint8_t g_speed_presets[6] = {50, 100, 150, 200, 230, 255};
+uint8_t g_speed_presets[6] = {1, 10, 50, 100, 230, 255};
 
 // Which preset are we currently using? (0 to 5)
 uint8_t g_selected_speed_index = 2; // Default to the 3rd speed
@@ -538,13 +539,15 @@ if ((xTaskGetTickCount() - g_last_battery_check) > pdMS_TO_TICKS(10000)) {
             f = fopen(path, "rb");
             if (f) {
                 uint8_t header[3];
-                if (fread(header, 1, 3, f) == 3) {
-                    img_h = (header[0] > MAX_LEDS) ? MAX_LEDS : header[0]; // Cap height
-                    img_w = (header[1] << 8) | header[2];
-                    // ADD THIS LINE to satisfy the compiler
-                    (void)img_w;
-                    bytes_in_buf = 0; buf_pos = 0;
-                } else { fclose(f); f = NULL; }
+if (fread(header, 1, 3, f) == 3) {
+    file_h = header[0]; // DO NOT CAP THIS YET
+    img_w = (header[1] << 8) | header[2];
+    img_h = (file_h > MAX_LEDS) ? MAX_LEDS : file_h; // Display height
+    
+    bytes_in_buf = 0; buf_pos = 0;
+    fseek(f, 3, SEEK_SET); 
+}else
+ { fclose(f); f = NULL; }
             }
             g_reloading_pattern = false;
         }
@@ -562,59 +565,69 @@ if ((xTaskGetTickCount() - g_last_battery_check) > pdMS_TO_TICKS(10000)) {
         }
 
         // Check if we need more data
-        if (buf_pos + slice_size > bytes_in_buf) {
-            // Safety: Ensure buf_pos hasn't gone crazy
-            if (buf_pos < bytes_in_buf) {
-                uint16_t remaining = bytes_in_buf - buf_pos;
-                memmove(read_buf, &read_buf[buf_pos], remaining);
-                bytes_in_buf = remaining;
-            } else {
-                bytes_in_buf = 0;
-            }
-            buf_pos = 0;
+// 1. Calculate how much data we need for one column
+slice_size = file_h * 3; 
 
-            // Calculate exactly how much space is left
-            size_t space_left = 1024 - bytes_in_buf;
-            if (space_left > 0) {
-                size_t n = fread(&read_buf[bytes_in_buf], 1, space_left, f);
-                if (n == 0) { // EOF
-                    fseek(f, 3, SEEK_SET);
-                    // Don't reset bytes_in_buf here yet, let it finish the current buffer
-                } else {
-                    bytes_in_buf += n;
-                }
-            }
-        }
+// 2. If current buffer doesn't have enough for a full slice, refill it
+if (buf_pos + slice_size > bytes_in_buf) {
+    // Move remaining fragment to the front of the buffer
+    uint16_t remaining = (bytes_in_buf > buf_pos) ? (bytes_in_buf - buf_pos) : 0;
+    if (remaining > 0) {
+        memmove(read_buf, &read_buf[buf_pos], remaining);
+    }
+    
+    buf_pos = 0;
+    bytes_in_buf = remaining;
+
+    // Read from file to fill the rest of the 1024-byte buffer
+    size_t to_read = 1024 - bytes_in_buf;
+    size_t n = fread(&read_buf[bytes_in_buf], 1, to_read, f);
+    
+    if (n == 0) { 
+        // We reached the actual end of the file, NOW we loop
+        fseek(f, 3, SEEK_SET); 
+        bytes_in_buf = 0;
+        // Optional: continue here to start fresh from the top of the loop
+        continue; 
+    }
+    bytes_in_buf += n;
+}
 
         // --- FINAL BOUNDARY CHECK BEFORE DISPLAY ---
-        if (buf_pos + slice_size <= bytes_in_buf) {
-            uint8_t *slice = &read_buf[buf_pos];
-            float scale = g_brightness / 255.0;
+uint8_t *slice = &read_buf[buf_pos];
+float scale = g_brightness / 255.0f;
 
-            // Use MAX_LEDS (your physical strip length) to drive the loop
-            for (int j = 0; j < MAX_LEDS; j++) {
-                // The modulo operator (%) tiles the image if physical LEDs > image height
-                // If img_h is 1, j % img_h is always 0 (perfect for 1-pixel height)
-                int pixel_index = (j % img_h) * 3;
+// Safety: Prevent modulo by zero if file is corrupt
+uint8_t h = (file_h > 0) ? file_h : MAX_LEDS;
 
-                uint8_t r = (uint8_t)(slice[pixel_index + 0] * scale);
-                uint8_t g = (uint8_t)(slice[pixel_index + 1] * scale);
-                uint8_t b = (uint8_t)(slice[pixel_index + 2] * scale);
+for (int j = 0; j < MAX_LEDS; j++) {
+    // MODULO LOGIC:
+    // If j is 20 and h is 24, it shows pixels 0-19.
+    // If j is 20 and h is 10, it repeats pixels 0-9 twice.
+    int data_row = j % h; 
+    int idx = data_row * 3;
 
-                // Setting pixels from the end (MAX_LEDS - 1 - j) to invert the display
-                // as per your Arduino logic requirement.
-                led_strip_set_pixel(led_strip, MAX_LEDS - 1 - j, r, g, b);
-            }
+    // Scaling and sending to hardware (R-G-B order)
+    led_strip_set_pixel(led_strip, (MAX_LEDS - 1) - j, 
+                        (uint8_t)(slice[idx] * scale), 
+                        (uint8_t)(slice[idx+1] * scale), 
+                        (uint8_t)(slice[idx+2] * scale));
+}
 
-            led_strip_refresh(led_strip);
-            buf_pos += slice_size;
-        }
-        uint8_t current_raw_speed = g_speed_presets[g_selected_speed_index];
-        int delay_ms = (255 - current_raw_speed) / 5;
+led_strip_refresh(led_strip);
+buf_pos += slice_size; 
 
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+// Speed handling
+uint8_t current_raw_speed = g_speed_presets[g_selected_speed_index];
+
+// We add +1 to ensure delay is never 0, which could starve other tasks
+int delay_ms = ((255 - current_raw_speed) / 5) + 1;
+
+vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 }
+//END of render task
+
 
 // advertising cleanup
 static int ble_gap_event_handler(struct ble_gap_event *event, void *arg) {
@@ -660,7 +673,7 @@ void start_advertising(void) {
 
     // --- 1. Main Advertising Packet ---
     memset(&fields, 0, sizeof(fields));
-    const char *name = "Pixel Poi";
+    const char *name = "Open Pixel Poi";
     fields.name = (uint8_t *)name;
     fields.name_len = strlen(name);
     fields.name_is_complete = 1;
@@ -750,44 +763,47 @@ typedef enum {
 void storage_worker_task(void *pvParameters) {
     flash_packet_t pkt;
     FILE* f = NULL;
+    static char active_path[32];
 
     while (1) {
         if (xQueueReceive(flash_queue, &pkt, portMAX_DELAY)) {
-            char path[32];
-            snprintf(path, sizeof(path), "/littlefs/b%d_s%d.bin", g_current_bank, g_current_slot);
-
-            // If f is NULL, this is the very first packet of a new upload
             if (f == NULL) {
-                unlink(path); // Clear space
-                f = fopen(path, "wb");
-                ESP_LOGI("STORAGE", "Opening new file: %s", path);
+                // Ensure slot/bank are valid per requirements
+                snprintf(active_path, sizeof(active_path), "/littlefs/b%d_s%d.bin", 
+                         (g_current_bank % 3), (g_current_slot % 5));
+                
+                f = fopen(active_path, "wb");
+                if (!f) {
+                    ESP_LOGE("STORAGE", "Failed to open %s for writing!", active_path);
+                    g_multipart_active = false;
+                    continue;
+                }
             }
 
-if (f) {
-    // 1. Calculate how much real data to write
-    // Skip the header if it's the first packet
-    // Subtract 1 from length if it's the final packet (removing the 0xD1 terminator)
-    int start_offset = pkt.skip_bytes;
-    int data_to_write = pkt.is_final ? (pkt.len - 1) : pkt.len;
-    int final_write_len = data_to_write - start_offset;
+            // Calculate actual data length excluding the terminator
+            int data_end = pkt.len;
+            if (pkt.is_final) {
+                for (int i = pkt.len - 1; i >= 0; i--) {
+                    if (pkt.pkt_data[i] == 0xD1) { data_end = i; break; }
+                }
+            }
 
-    if (final_write_len > 0) {
-        fwrite(pkt.pkt_data + start_offset, 1, final_write_len, f);
-    }
+            int final_write_len = data_end - pkt.skip_bytes;
+            if (final_write_len > 0 && f) {
+                fwrite(pkt.pkt_data + pkt.skip_bytes, 1, final_write_len, f);
+            }
 
-    // 2. Only close when the flag tells us to
-    if (pkt.is_final) {
-        fflush(f);
-        fsync(fileno(f));
-        fclose(f);
-        f = NULL;
-        
-        g_multipart_active = false;
-        led_task_running = true;
-        g_reloading_pattern = true; 
-        ESP_LOGI("STORAGE", "Upload saved successfully.");
-    }
-}
+            if (pkt.is_final && f) {
+                fflush(f);
+                fsync(fileno(f));
+                fclose(f);
+                f = NULL;
+                
+                g_multipart_active = false;
+                led_task_running = true;
+                g_reloading_pattern = true; // Refresh the LED task
+                ESP_LOGI("STORAGE", "Successfully saved %s", active_path);
+            }
         }
     }
 }
@@ -806,6 +822,7 @@ void setTxCharacteristicValue(uint8_t* data, uint16_t len) {
 }
 
 // --- GATT Callback ---
+
 static int gatt_svr_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg) {
     conn_hdl = conn_handle;
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
@@ -844,6 +861,30 @@ static int gatt_svr_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_ga
 
             // Handle standard commands
             switch (code) {
+
+   case CC_SET_PATTERN: 
+    
+    
+    flash_packet_t pkt = {0};
+    pkt.len = len;
+    
+    // Logic from the original code: If less than full MTU, it's the end
+
+    
+    // If this is the start (contains 0xD0 and CC_SET_PATTERN)
+    if (len >= 5 && data[0] == 0xD0 && data[1] == CC_SET_PATTERN) {
+        pkt.skip_bytes = 2; 
+        g_multipart_active = true;
+        led_task_running = false; // Park the LEDs
+    } else {
+        pkt.skip_bytes = 0;
+    }
+
+    memcpy(pkt.pkt_data, data, len);
+    xQueueSend(flash_queue, &pkt, portMAX_DELAY);
+
+     // Reset state for next upload
+    break;
 
 case CC_GET_CONFIG:
 {
@@ -1041,29 +1082,11 @@ break;
                 }
                 break;
 
-            case CC_SET_PATTERN: 
-    
-    
-    flash_packet_t pkt = {0};
-    pkt.len = payload_len;
-    
-    // Logic from the original code: If less than full MTU, it's the end
-    pkt.is_final = (payload_len < 509); 
-    
-    // If this is the start (contains 0xD0 and CC_SET_PATTERN)
-    if (payload_len >= 5 && payload[0] == 0xD0 && payload[1] == CC_SET_PATTERN) {
-        pkt.skip_bytes = 5; 
-        g_multipart_active = true;
-        led_task_running = false; // Park the LEDs
-    } else {
-        pkt.skip_bytes = 0;
-    }
+  
+  
+  
+  
 
-    memcpy(pkt.pkt_data, payload, payload_len);
-    xQueueSend(flash_queue, &pkt, portMAX_DELAY);
-
-     // Reset state for next upload
-    break;
 
 
             case CC_GET_FW_VERSION:
@@ -1124,17 +1147,27 @@ break;
         }
 
         // --- DATA CHUNK HANDLING (Multipart) ---
-        if (g_multipart_active) {
-            flash_packet_t pkt;
-            pkt.len = len;
-            memcpy(pkt.pkt_data, data, len);
+if (g_multipart_active) {
+    flash_packet_t pkt = {0}; // Initialize to 0 so is_final is false by default
+    pkt.len = len;
+    pkt.skip_bytes = 0;
+    memcpy(pkt.pkt_data, data, len);
 
-            if (xQueueSend(flash_queue, &pkt, pdMS_TO_TICKS(10)) != pdPASS) {
-                ESP_LOGW("BLE", "Queue full! Dropping packet or returning error.");
-                return BLE_ATT_ERR_PREPARE_QUEUE_FULL;
-            }
-            return 0;
-        }
+    // Check if this specific chunk contains the end-of-file marker (0xD1)
+    if (len > 0 && data[len - 1] == 0xD1) {
+        pkt.is_final = true;
+    } else {
+        // Fallback: if the packet is smaller than a standard MTU chunk, 
+        // it's likely the last one.
+        pkt.is_final = (len < 500); 
+    }
+
+    if (xQueueSend(flash_queue, &pkt, pdMS_TO_TICKS(10)) != pdPASS) {
+        ESP_LOGW("BLE", "Queue full! Dropping packet");
+        return BLE_ATT_ERR_PREPARE_QUEUE_FULL;
+    }
+    return 0;
+}
     }
     return 0;
 }
