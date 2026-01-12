@@ -27,6 +27,9 @@ static size_t storage_total = 0;
 static size_t storage_used = 0;
 static uint32_t free_space_kb = 0;
 uint8_t file_h = 0; // The real height from the file
+volatile uint16_t bytes_in_buf = 0; 
+volatile uint16_t buf_pos = 0;
+uint8_t read_buf[1024]; // The physical buffer
 //queue
 #include "freertos/queue.h"
 
@@ -420,8 +423,7 @@ void pov_render_task(void *pvParameters) {
     static uint8_t read_buf[1024];
     static FILE* f = NULL;
 
-    uint16_t buf_pos = 0;
-    uint16_t bytes_in_buf = 0;
+
     uint8_t img_h = 0;
     uint16_t img_w = 0;
 
@@ -532,98 +534,106 @@ if ((xTaskGetTickCount() - g_last_battery_check) > pdMS_TO_TICKS(10000)) {
         }
 
         // --- FILE OPENING ---
+// --- FILE OPENING ---
         if (g_reloading_pattern || f == NULL) {
             if (f) { fclose(f); f = NULL; }
             char path[32];
-            snprintf(path, sizeof(path), "/littlefs/b%d_s%d.bin", g_current_bank, g_current_slot);
+            // Using modulo to enforce Bank 0-2 and Slot 0-4 constraints
+            snprintf(path, sizeof(path), "/littlefs/b%d_s%d.bin", (g_current_bank % 3), (g_current_slot % 5));
+            
             f = fopen(path, "rb");
             if (f) {
                 uint8_t header[3];
-if (fread(header, 1, 3, f) == 3) {
-    file_h = header[0]; // DO NOT CAP THIS YET
-    img_w = (header[1] << 8) | header[2];
-    img_h = (file_h > MAX_LEDS) ? MAX_LEDS : file_h; // Display height
-    
-    bytes_in_buf = 0; buf_pos = 0;
-    fseek(f, 3, SEEK_SET); 
-}else
- { fclose(f); f = NULL; }
+                if (fread(header, 1, 3, f) == 3) {
+                    file_h = header[0]; // Raw height from file (e.g., 10 or 24)
+                    img_w = (header[1] << 8) | header[2];
+                    
+                    // Reset buffer state for the new file
+                    bytes_in_buf = 0; 
+                    buf_pos = 0;
+                    // Header is already read, pointer is at byte 3 (start of pixels)
+                } else { 
+                    fclose(f); 
+                    f = NULL; 
+                }
             }
             g_reloading_pattern = false;
         }
 
         if (f == NULL) {
             default_rainbow_pattern();
+            vTaskDelay(pdMS_TO_TICKS(10)); // Prevent tight-looping
             continue;
         }
 
-        // --- THE "SHIELDED" BUFFER MATH ---
-        size_t slice_size = img_h * 3;
+        // --- THE BUFFER & MODULO RENDER LOGIC ---
+        
+        // 1. Calculate how much data we need for exactly ONE vertical column
+        // We use the full file_h because that's how the web app packed the data.
+        size_t slice_size = file_h * 3; 
+
+        // Safety: If file_h is crazy (corrupt header), skip this file
         if (slice_size == 0 || slice_size > 1024) {
-            fseek(f, 3, SEEK_SET); bytes_in_buf = 0; buf_pos = 0;
+            ESP_LOGE("RENDER", "Invalid slice size: %d", (int)slice_size);
+            fseek(f, 3, SEEK_SET); 
+            bytes_in_buf = 0; buf_pos = 0;
+            vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        // Check if we need more data
-// 1. Calculate how much data we need for one column
-slice_size = file_h * 3; 
+        // 2. If current buffer doesn't have enough for a full vertical slice, refill it
+        if (buf_pos + slice_size > bytes_in_buf) {
+            uint16_t remaining = (bytes_in_buf > buf_pos) ? (bytes_in_buf - buf_pos) : 0;
+            if (remaining > 0) {
+                memmove(read_buf, &read_buf[buf_pos], remaining);
+            }
+            
+            buf_pos = 0;
+            bytes_in_buf = remaining;
 
-// 2. If current buffer doesn't have enough for a full slice, refill it
-if (buf_pos + slice_size > bytes_in_buf) {
-    // Move remaining fragment to the front of the buffer
-    uint16_t remaining = (bytes_in_buf > buf_pos) ? (bytes_in_buf - buf_pos) : 0;
-    if (remaining > 0) {
-        memmove(read_buf, &read_buf[buf_pos], remaining);
-    }
-    
-    buf_pos = 0;
-    bytes_in_buf = remaining;
+            size_t to_read = 1024 - bytes_in_buf;
+            size_t n = fread(&read_buf[bytes_in_buf], 1, to_read, f);
+            
+            if (n == 0) { 
+                // End of file: Loop back to start (skipping the 3-byte header)
+                fseek(f, 3, SEEK_SET); 
+                bytes_in_buf = remaining; // Keep what we had
+                // If we couldn't even read one slice after looping, reset
+                if (bytes_in_buf < slice_size) {
+                    bytes_in_buf = 0;
+                }
+                continue; 
+            }
+            bytes_in_buf += n;
+        }
 
-    // Read from file to fill the rest of the 1024-byte buffer
-    size_t to_read = 1024 - bytes_in_buf;
-    size_t n = fread(&read_buf[bytes_in_buf], 1, to_read, f);
-    
-    if (n == 0) { 
-        // We reached the actual end of the file, NOW we loop
-        fseek(f, 3, SEEK_SET); 
-        bytes_in_buf = 0;
-        // Optional: continue here to start fresh from the top of the loop
-        continue; 
-    }
-    bytes_in_buf += n;
-}
+        // 3. FINAL DISPLAY (Modulo Scaling)
+        uint8_t *slice = &read_buf[buf_pos];
+        float scale = g_brightness / 255.0f;
+        uint8_t h_divisor = (file_h > 0) ? file_h : MAX_LEDS;
 
-        // --- FINAL BOUNDARY CHECK BEFORE DISPLAY ---
-uint8_t *slice = &read_buf[buf_pos];
-float scale = g_brightness / 255.0f;
+        for (int j = 0; j < MAX_LEDS; j++) {
+            // This is where the magic happens: 
+            // If j > file_h, it wraps around back to the start of the column
+            int data_row = j % h_divisor; 
+            int idx = data_row * 3;
 
-// Safety: Prevent modulo by zero if file is corrupt
-uint8_t h = (file_h > 0) ? file_h : MAX_LEDS;
+            led_strip_set_pixel(led_strip, (MAX_LEDS - 1) - j, 
+                                (uint8_t)(slice[idx] * scale), 
+                                (uint8_t)(slice[idx+1] * scale), 
+                                (uint8_t)(slice[idx+2] * scale));
+        }
 
-for (int j = 0; j < MAX_LEDS; j++) {
-    // MODULO LOGIC:
-    // If j is 20 and h is 24, it shows pixels 0-19.
-    // If j is 20 and h is 10, it repeats pixels 0-9 twice.
-    int data_row = j % h; 
-    int idx = data_row * 3;
+        led_strip_refresh(led_strip);
+        
+        // Advance the buffer position by exactly one column
+        buf_pos += slice_size; 
 
-    // Scaling and sending to hardware (R-G-B order)
-    led_strip_set_pixel(led_strip, (MAX_LEDS - 1) - j, 
-                        (uint8_t)(slice[idx] * scale), 
-                        (uint8_t)(slice[idx+1] * scale), 
-                        (uint8_t)(slice[idx+2] * scale));
-}
+        // 4. SPEED HANDLING
+        uint8_t current_raw_speed = g_speed_presets[g_selected_speed_index];
+        int delay_ms = ((255 - current_raw_speed) / 5) + 1;
 
-led_strip_refresh(led_strip);
-buf_pos += slice_size; 
-
-// Speed handling
-uint8_t current_raw_speed = g_speed_presets[g_selected_speed_index];
-
-// We add +1 to ensure delay is never 0, which could starve other tasks
-int delay_ms = ((255 - current_raw_speed) / 5) + 1;
-
-vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 }
 //END of render task
@@ -862,29 +872,35 @@ static int gatt_svr_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_ga
             // Handle standard commands
             switch (code) {
 
-   case CC_SET_PATTERN: 
-    
-    
+case CC_SET_PATTERN: {
     flash_packet_t pkt = {0};
     pkt.len = len;
-    
-    // Logic from the original code: If less than full MTU, it's the end
 
-    
-    // If this is the start (contains 0xD0 and CC_SET_PATTERN)
+    // 1. Identify Start of Pattern
     if (len >= 5 && data[0] == 0xD0 && data[1] == CC_SET_PATTERN) {
-        pkt.skip_bytes = 2; 
+        pkt.skip_bytes = 2;       // Skip protocol header
         g_multipart_active = true;
-        led_task_running = false; // Park the LEDs
+        led_task_running = false; // Stop LEDs to prioritize Flash write
+        ESP_LOGI("BLE", "Pattern Start Detected");
     } else {
         pkt.skip_bytes = 0;
     }
 
+    // 2. CATCH SMALL UPLOADS (Single Packet Case)
+    // Check if the 0xD1 end marker is present in this same packet
+    if (len > 0 && data[len - 1] == 0xD1) {
+        pkt.is_final = true;
+        g_multipart_active = false; // No more packets coming
+        ESP_LOGI("BLE", "Single-packet upload complete");
+    } else {
+        // If it's a large file, the first packet won't have 0xD1
+        pkt.is_final = false; 
+    }
+
     memcpy(pkt.pkt_data, data, len);
     xQueueSend(flash_queue, &pkt, portMAX_DELAY);
-
-     // Reset state for next upload
     break;
+}
 
 case CC_GET_CONFIG:
 {
@@ -1075,13 +1091,33 @@ break;
                 ESP_LOG_BUFFER_HEX("BLE_SPEED_RAW", data, len);
                 break;
 
-            case CC_SET_PATTERN_SLOT:
-                if (len >= 3) {
-                    g_current_slot = data[2];
-                    g_reloading_pattern = true; // Trigger LED reload
-                }
-                break;
+case CC_SET_PATTERN_SLOT:
+    if (len >= 3) {
+        // Enforce the 0x00 to 0x04 constraint mentioned in your saved info
+        uint8_t requested_slot = data[2];
+        if (requested_slot <= 0x04) {
+            g_current_slot = requested_slot;
+            
+            // 1. Force the render task to close the old file and open the new one
+            g_reloading_pattern = true; 
+            
+            // 2. Reset buffer pointers immediately
+            // This prevents the render task from trying to read from the 
+            // old 'read_buf' while the new file is being opened.
+            bytes_in_buf = 0;
+            buf_pos = 0;
 
+            // 3. Clear the LED hardware immediately (Optional but recommended)
+            // This stops the "frozen" frame of the old slot from showing.
+            if (led_strip) {
+                led_strip_clear(led_strip);
+                led_strip_refresh(led_strip);
+            }
+
+            ESP_LOGI("BLE", "Slot changed to %d. Buffer cleared.", g_current_slot);
+        }
+    }
+    break;
   
   
   
