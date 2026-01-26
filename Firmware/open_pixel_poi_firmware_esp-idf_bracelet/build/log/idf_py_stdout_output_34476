@@ -1,0 +1,20 @@
+[1/9] Performing build step for 'bootloader'
+[1/1] cd /home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader/esp-idf/esptool_py && /home/duke/.espressif/python_env/idf5.3_py3.12_env/bin/python /home/duke/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x0 /home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader/bootloader.bin
+Bootloader binary size 0x5180 bytes. 0x2e80 bytes (36%) free.
+[2/9] No install step for 'bootloader'
+[3/9] Completed 'bootloader'
+[4/9] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/main.c.obj
+[5/9] Linking C static library esp-idf/main/libmain.a
+[6/9] Generating ld/sections.ld
+info: INFO: Symbol IDF_TARGET_LINUX defined in multiple locations (see below). Please check if this is a correct behavior or a random name match:
+    /home/duke/esp/esp-idf/Kconfig:162
+    /home/duke/esp/esp-idf/Kconfig:78
+[7/9] Linking CXX executable c3_mini_blink.elf
+[8/9] Generating binary image from built executable
+esptool.py v4.10.0
+Creating esp32c3 image...
+Merged 1 ELF section
+Successfully created esp32c3 image.
+Generated /home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/c3_mini_blink.bin
+[9/9] cd /home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/esp-idf/esptool_py && /home/duke/.espressif/python_env/idf5.3_py3.12_env/bin/python /home/duke/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/partition_table/partition-table.bin /home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/c3_mini_blink.bin
+c3_mini_blink.bin binary size 0x93230 bytes. Smallest app partition is 0x1e0000 bytes. 0x14cdd0 bytes (69%) free.

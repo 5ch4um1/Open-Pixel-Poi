@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/CMakeFiles/bootloader"
+		},
+		{
+			"file" : "/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/CMakeFiles/bootloader.rule"
+		},
+		{
+			"file" : "/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/CMakeFiles/bootloader-complete.rule"
+		},
+		{
+			"file" : "/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule"
+		},
+		{
+			"file" : "/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule"
+		},
+		{
+			"file" : "/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule"
+		},
+		{
+			"file" : "/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule"
+		},
+		{
+			"file" : "/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule"
+		},
+		{
+			"file" : "/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule"
+		},
+		{
+			"file" : "/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"bootloader"
+		],
+		"name" : "bootloader"
+	}
+}

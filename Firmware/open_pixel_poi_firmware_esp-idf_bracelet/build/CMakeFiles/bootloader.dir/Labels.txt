@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/CMakeFiles/bootloader
+/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/CMakeFiles/bootloader.rule
+/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/CMakeFiles/bootloader-complete.rule
+/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/home/duke/Open-Pixel-Poi/Firmware/open_pixel_poi_firmware_esp-idf_bracelet/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule
