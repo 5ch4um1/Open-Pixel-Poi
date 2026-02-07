@@ -35,13 +35,13 @@ uint8_t read_buf[1024]; // The physical buffer
 
 // --- Hardware ---
 #define LED_GPIO            GPIO_NUM_6
-#define BUTTON_PIN         GPIO_NUM_3
+#define BUTTON_GPIO         GPIO_NUM_3
 #define REGULATOR_GPIO      GPIO_NUM_7
-#define MAX_LEDS            20
+#define MAX_LEDS            21
 #define BATTERY_SCALING_FACTOR 3.08f
 #define adcchan ADC_CHANNEL_2
 // This is the actual value used in your LED loop on startup (updated via the index)
-uint8_t g_brightness = 10;
+uint8_t g_brightness = 20;
 
 
 typedef struct {
@@ -107,13 +107,13 @@ uint32_t g_shuffle_duration_ms = 5000; // Default 5 seconds
 uint32_t g_last_shuffle_tick = 0;
 
 //Button
-
+#define BOOT_BUTTON_PIN 9
 volatile bool g_btn_is_down = false;
 volatile TickType_t g_btn_transition_tick = 0;
 volatile TickType_t g_last_press_tick = 0; // Added this
 
 static void IRAM_ATTR button_isr_handler(void* arg) {
-    bool current_level = gpio_get_level(BUTTON_PIN);
+    bool current_level = gpio_get_level(BOOT_BUTTON_PIN);
     g_btn_is_down = !current_level;
     g_btn_transition_tick = xTaskGetTickCountFromISR();
 
@@ -145,40 +145,20 @@ bool g_emergency_mode = false;
 adc_oneshot_unit_handle_t adc1_handle;
 
 float read_battery_voltage() {
+    
     uint32_t adc_sum = 0;
     int samples = 16;
-    int success_count = 0;
 
-    for (int i = 0; i < samples; i++) {
-        int temp_raw = -1; 
-        esp_err_t ret = adc_oneshot_read(adc1_handle, adcchan, &temp_raw);
-
-        if (ret == ESP_OK) {
-            printf("Sample %d: Raw Value = %d\n", i, temp_raw);
-            adc_sum += temp_raw;
-            success_count++;
-        } else {
-            // This will tell us EXACTLY why it's failing (e.g., ESP_ERR_INVALID_STATE)
-            printf("Sample %d: Read FAILED. Error: %s\n", i, esp_err_to_name(ret));
+   for (int i = 0; i < samples; i++) {
+        int temp;
+        if (adc_oneshot_read(adc1_handle, adcchan, &temp) == ESP_OK) {
+            adc_sum += temp;
         }
     }
-
-    if (success_count == 0) {
-        printf("ERROR: No successful ADC reads! Check handle and channel init.\n");
-        return 0.0f;
-    }
-
-    float adc_raw_avg = (float)adc_sum / success_count;
     
-    // Using the 12dB attenuation (0-3.1V range) math:
-    // (Average Raw / 4095) * Max_Voltage_Range * Resistor_Divider
-    float pin_volt = (adc_raw_avg * 3.1f) / 4095.0f; 
-    float battery_volt = pin_volt * BATTERY_DIVIDER_RATIO;
-
-    printf("Final Calculation: Avg_Raw: %.2f | Pin_V: %.2fV | Battery_V: %.2fV\n", 
-            adc_raw_avg, pin_volt, battery_volt);
-
-    return battery_volt;
+    adc_raw = adc_sum / samples;
+    float pin_volt = (adc_raw * BATTERY_SCALING_FACTOR) / 4095.0f;
+    return pin_volt * BATTERY_DIVIDER_RATIO;
 }
 void show_sos_signal() {
     const uint8_t dim_red = 10; // Keep it low to save battery
@@ -425,15 +405,14 @@ void run_flash_animation(uint32_t color) {
 
 void render_frame(uint8_t *frame_ptr) {
     if (frame_ptr == NULL) return;
-    float scale = g_brightness / 255.0f;
 
     for (int j = 0; j < MAX_LEDS; j++) {
         int offset = j * 3;
-        // THE INVERSION: Row 0 -> LED 19, Row 19 -> LED 0
+        // Your specific mapping logic
         led_strip_set_pixel(led_strip, (MAX_LEDS - 1) - j, 
-                            (uint8_t)(frame_ptr[offset] * scale),     
-                            (uint8_t)(frame_ptr[offset + 1] * scale), 
-                            (uint8_t)(frame_ptr[offset + 2] * scale));
+                            frame_ptr[offset],     // Red
+                            frame_ptr[offset + 1], // Green
+                            frame_ptr[offset + 2]);// Blue
     }
     led_strip_refresh(led_strip);
 }
@@ -588,64 +567,58 @@ if ((xTaskGetTickCount() - g_last_battery_check) > pdMS_TO_TICKS(10000)) {
         }
 
         // --- THE BUFFER & MODULO RENDER LOGIC ---
-        
-        // 1. Calculate how much data we need for exactly ONE vertical column
-        // We use the full file_h because that's how the web app packed the data.
-        size_t slice_size = file_h * 3; 
 
-        // Safety: If file_h is crazy (corrupt header), skip this file
-        if (slice_size == 0 || slice_size > 1024) {
-            ESP_LOGE("RENDER", "Invalid slice size: %d", (int)slice_size);
-            fseek(f, 3, SEEK_SET); 
-            bytes_in_buf = 0; buf_pos = 0;
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
+int slice_size = file_h * 3;
 
-        // 2. If current buffer doesn't have enough for a full vertical slice, refill it
-        if (buf_pos + slice_size > bytes_in_buf) {
-            uint16_t remaining = (bytes_in_buf > buf_pos) ? (bytes_in_buf - buf_pos) : 0;
-            if (remaining > 0) {
-                memmove(read_buf, &read_buf[buf_pos], remaining);
-            }
-            
-            buf_pos = 0;
-            bytes_in_buf = remaining;
-
-            size_t to_read = 1024 - bytes_in_buf;
-            size_t n = fread(&read_buf[bytes_in_buf], 1, to_read, f);
-            
-if (n == 0) { 
-    // 1. Reset file pointer to after the 3-byte header
-    fseek(f, 3, SEEK_SET); 
-    bytes_in_buf = 0; 
+// 2. Refill the buffer if we don't have enough for a full file slice
+if (buf_pos + slice_size > bytes_in_buf) {
+    uint16_t remaining = bytes_in_buf - buf_pos;
+    if (remaining > 0) memmove(read_buf, &read_buf[buf_pos], remaining);
+    bytes_in_buf = remaining;
     buf_pos = 0;
-    
-    // 2. IMMEDIATELY read the first chunk of the new loop
-    size_t n2 = fread(read_buf, 1, 1024, f);
-    if (n2 > 0) bytes_in_buf = n2;
 
-    // 3. REMOVE 'continue'. 
-    // Let the code fall through to the render loop so it displays Row 0 instantly.
+    size_t n = fread(&read_buf[bytes_in_buf], 1, 1024 - bytes_in_buf, f);
+    if (n == 0) { // End of file: loop back to start (after 3-byte header)
+        fseek(f, 3, SEEK_SET);
+        n = fread(&read_buf[bytes_in_buf], 1, 1024 - bytes_in_buf, f);
+    }
+    bytes_in_buf += n;
 }
-            bytes_in_buf += n;
-        }
+
 // If, after attempting to refill, we STILL don't have enough data 
         // (e.g., partial read, tiny file, or split packet), skip rendering this frame.
         if (bytes_in_buf < buf_pos + slice_size) {
             vTaskDelay(1); // Yield to let system catch up
             continue;
         }
-
-        // 3. FINAL DISPLAY (Modulo Scaling)
-uint8_t *slice = &read_buf[buf_pos];
         
-        // Use the common function. This fixes the "double inversion" or "missing inversion"
-        render_frame(slice);
+if (bytes_in_buf >= slice_size) {
+        // 3. FINAL DISPLAY (Modulo Scaling)
+        uint8_t *slice = &read_buf[buf_pos];
+        float scale = g_brightness / 255.0f;
 
-        // Advance the buffer position
-        buf_pos += slice_size;
+        // 1. Loop through the PHYSICAL LEDs (20)
+        for (int j = 0; j < MAX_LEDS; j++) {
+    // Welches Daten-Segment aus der Datei nehmen wir?
+    // Falls file_h (Dateihöhe) von MAX_LEDS abweicht, hilft das Modulo
+    int data_row = j % file_h; 
+    int offset = data_row * 3;
 
+    // 2. Korrekte Inversion für 20 LEDs:
+    // Wenn j=0 -> Index 19
+    // Wenn j=19 -> Index 0
+    led_strip_set_pixel(led_strip, (MAX_LEDS - 1) - j, 
+                        (uint8_t)(slice[offset] * scale), 
+                        (uint8_t)(slice[offset+1] * scale), 
+                        (uint8_t)(slice[offset+2] * scale));
+}
+
+led_strip_refresh(led_strip);
+
+        // 2. THE CRITICAL FIX: Advance buf_pos by the ACTUAL FILE slice size
+        // This ensures the next frame starts at the correct byte even if file_h is 21.
+        buf_pos += (slice_size);
+}
         // 4. SPEED HANDLING
         uint8_t current_raw_speed = g_speed_presets[g_selected_speed_index];
         int delay_ms = ((255 - current_raw_speed) / 5) + 1;
@@ -1362,11 +1335,12 @@ led_strip_config_t strip_config = {
     .led_model = LED_MODEL_WS2812,
 };
 
-led_strip_rmt_config_t rmt_config = {
-    .clk_src = RMT_CLK_SRC_DEFAULT, // Use default clock source
-    .resolution_hz = 10 * 1000 * 1000, // 10MHz resolution (standard for WS2812B)
-          
-};
+    led_strip_rmt_config_t rmt_config = {
+    .clk_src = RMT_CLK_SRC_DEFAULT,
+    .resolution_hz = 10 * 1000 * 500, // 10MHz
+    .mem_block_symbols = 128,          // You already tried this, keep it
+    
+    };
 
 // Change RMT to SPI here:
 ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
@@ -1377,7 +1351,7 @@ ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip)
     ESP_LOGI(TAG, "LED Strip Initialized.");
     // --- Button setup ---
     gpio_config_t btn_conf = {
-        .pin_bit_mask = (1ULL << BUTTON_PIN),
+        .pin_bit_mask = (1ULL << BOOT_BUTTON_PIN),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .intr_type = GPIO_INTR_ANYEDGE,
@@ -1388,7 +1362,7 @@ ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip)
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
 
     // 2. Use the NEW function name:
-    gpio_isr_handler_add(BUTTON_PIN, button_isr_handler, NULL);
+    gpio_isr_handler_add(BOOT_BUTTON_PIN, button_isr_handler, NULL);
     // --- Button setup end ---
 
 
