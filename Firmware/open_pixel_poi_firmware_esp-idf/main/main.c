@@ -16,6 +16,16 @@
 #include "esp_random.h"
 #include "esp_attr.h"
 #include "esp_intr_alloc.h"
+#include "esp_sleep.h"
+
+// Helper for animations (similar to FastLED)
+#ifndef qsub8
+#define qsub8(x, y) ((x>y)?x-y:0)
+#endif
+
+#ifndef scale8
+#define scale8(i, scale) (((uint16_t)i * (1+(uint16_t)scale)) >> 8)
+#endif
 
 //debug
 
@@ -37,7 +47,7 @@ uint8_t read_buf[1024]; // The physical buffer
 #define LED_GPIO            GPIO_NUM_6
 #define BUTTON_GPIO         GPIO_NUM_3
 #define REGULATOR_GPIO      GPIO_NUM_7
-#define MAX_LEDS            21
+#define MAX_LEDS            20
 #define BATTERY_SCALING_FACTOR 3.08f
 #define adcchan ADC_CHANNEL_2
 // This is the actual value used in your LED loop on startup (updated via the index)
@@ -107,13 +117,12 @@ uint32_t g_shuffle_duration_ms = 5000; // Default 5 seconds
 uint32_t g_last_shuffle_tick = 0;
 
 //Button
-#define BOOT_BUTTON_PIN 9
 volatile bool g_btn_is_down = false;
 volatile TickType_t g_btn_transition_tick = 0;
 volatile TickType_t g_last_press_tick = 0; // Added this
 
 static void IRAM_ATTR button_isr_handler(void* arg) {
-    bool current_level = gpio_get_level(BOOT_BUTTON_PIN);
+    bool current_level = gpio_get_level(BUTTON_GPIO);
     g_btn_is_down = !current_level;
     g_btn_transition_tick = xTaskGetTickCountFromISR();
 
@@ -125,7 +134,7 @@ static void IRAM_ATTR button_isr_handler(void* arg) {
 // Add the prototype for the flash animation if you don't have it
 void run_flash_animation(uint32_t color);
 
-// Simplified ISR to track both Press and Release
+
 
 
 
@@ -232,6 +241,13 @@ typedef enum {
 // Global state variable
 // volatile ensures the LED task sees changes made in the BLE callback immediately
 static volatile led_mode_t current_mode = MODE_PATTERN;
+
+// Animation modes
+static volatile uint8_t g_current_animation = 0; // 0 for default rainbow, 1 for Fire, 2 for Ocean, 3 for Custom
+
+void fire_animation(led_strip_handle_t strip, uint8_t brightness);
+void ocean_waves_animation(led_strip_handle_t strip, uint8_t brightness);
+void custom_animation(led_strip_handle_t strip, uint8_t brightness);
 
 
 //streaming
@@ -390,6 +406,105 @@ void default_rainbow_pattern() {
     vTaskDelay(pdMS_TO_TICKS(20));
 }
 
+// Fire Animation
+void fire_animation(led_strip_handle_t strip, uint8_t brightness) {
+    static uint8_t heat[MAX_LEDS];
+    static bool initialized = false;
+
+    if (!initialized) {
+        memset(heat, 0, sizeof(heat));
+        initialized = true;
+    }
+
+    // Cool down every cell a little
+    for(int i = 0; i < MAX_LEDS; i++) {
+        heat[i] = qsub8(heat[i], esp_random() % ((255 / MAX_LEDS) * 2) + 1);
+    }
+
+    // Heat up the bottom a bit
+    for(int i = 0; i < esp_random() % (MAX_LEDS / 5) + 1; i++) {
+        heat[esp_random() % 3] = heat[esp_random() % 3] + (esp_random() % 160) + 96;
+    }
+
+    // Move heat up the strip
+    for(int k = MAX_LEDS - 1; k >= 2; k--) {
+        heat[k] = (heat[k - 1] + heat[k - 2] + heat[k - 2]) / 3;
+    }
+
+    // Convert heat to LED colors
+    float scale = brightness / 255.0f;
+    for(int j = 0; j < MAX_LEDS; j++) {
+        uint8_t t192 = scale8(heat[j], 191);
+        uint8_t r = t192;
+        uint8_t g = scale8(t192, 100); // Less green than red
+        uint8_t b = 0; // No blue
+
+        // Adjust for overall brightness
+        led_strip_set_pixel(strip, j, (uint8_t)(r * scale), (uint8_t)(g * scale), (uint8_t)(b * scale));
+    }
+    led_strip_refresh(strip);
+    vTaskDelay(pdMS_TO_TICKS(20));
+}
+
+// Ocean Waves Animation
+void ocean_waves_animation(led_strip_handle_t strip, uint8_t brightness) {
+    static uint32_t hue_offset = 0;
+    float scale = brightness / 255.0f;
+
+    for (int i = 0; i < MAX_LEDS; i++) {
+        // Calculate a sine wave for position, offset by time
+        uint8_t wave = (uint8_t)(127 + 127 * sin((i * 0.3 + hue_offset * 0.05)));
+
+        // Blend between deep blue and turquoise
+        uint8_t r = (uint8_t)(0 * scale);
+        uint8_t g = (uint8_t)(scale8(wave, 150) * scale); // More green for turquoise
+        uint8_t b = (uint8_t)(scale8(wave, 255) * scale); // Full blue for deep water
+
+        led_strip_set_pixel(strip, i, r, g, b);
+    }
+    led_strip_refresh(strip);
+    hue_offset++;
+    vTaskDelay(pdMS_TO_TICKS(30));
+}
+
+// Custom Animation (Matrix Rain - simplified)
+void custom_animation(led_strip_handle_t strip, uint8_t brightness) {
+    static uint8_t trail[MAX_LEDS]; // Stores brightness of each LED
+    static bool initialized = false;
+
+    if (!initialized) {
+        memset(trail, 0, sizeof(trail));
+        initialized = true;
+    }
+
+    // Shift pixels down and fade
+    for (int i = MAX_LEDS - 1; i > 0; i--) {
+        trail[i] = trail[i-1];
+        if (trail[i] > 0) { // Fade out
+            trail[i] = qsub8(trail[i], 10);
+        }
+    }
+    trail[0] = 0; // Clear the first pixel
+
+    // Randomly start a new "drop" at the top
+    if (esp_random() % 10 < 3) { // 30% chance to start a new drop
+        trail[0] = (esp_random() % 100) + 155; // Bright green at the top
+    }
+
+    float scale = brightness / 255.0f;
+    for (int i = 0; i < MAX_LEDS; i++) {
+        uint8_t val = trail[i];
+        if (val > 0) {
+            // Green "rain" effect
+            led_strip_set_pixel(strip, i, (uint8_t)(0 * scale), (uint8_t)(val * scale), (uint8_t)(0 * scale));
+        } else {
+            led_strip_set_pixel(strip, i, 0, 0, 0); // Off
+        }
+    }
+    led_strip_refresh(strip);
+    vTaskDelay(pdMS_TO_TICKS(50));
+}
+
 //flash animation
 void run_flash_animation(uint32_t color) {
     uint8_t r = (color >> 16) & 0xFF;
@@ -436,14 +551,40 @@ void pov_render_task(void *pvParameters) {
 
         TickType_t current_tick = xTaskGetTickCount();
 
-        // 1. Detect Long Press to enter "Menu Mode"
+        // 1. Detect Long Press to enter "Menu Mode" or Deep Sleep
         if (g_btn_is_down) {
-            // 1. Detect Long Press
+            TickType_t press_duration = current_tick - g_btn_transition_tick;
+
+            // Deep Sleep Long Press (longer than 3 seconds)
+            if (press_duration > pdMS_TO_TICKS(3000)) {
+                ESP_LOGI("BTN", "Deep Sleep initiated by long press!");
+                // Turn off LEDs before deep sleep
+                led_strip_clear(led_strip);
+                led_strip_refresh(led_strip);
+                // Turn off the voltage regulator
+                gpio_set_level(REGULATOR_GPIO, 0);
+
+                // --- NEW: Wait for button release before enabling deep sleep ---
+                ESP_LOGI("BTN", "Waiting for button release before deep sleep...");
+                while (g_btn_is_down) {
+                    vTaskDelay(pdMS_TO_TICKS(50)); // Check every 50ms
+                }
+                vTaskDelay(pdMS_TO_TICKS(100)); // Debounce delay after release
+
+                // Configure button for wake-up with GPIO
+                esp_deep_sleep_enable_gpio_wakeup(1ULL << BUTTON_GPIO, ESP_GPIO_WAKEUP_GPIO_LOW);
+                esp_deep_sleep_start();
+            }
+
+            // 1. Detect Long Press to enter "Menu Mode"
             if (!g_in_menu_mode && (current_tick - g_btn_transition_tick) > pdMS_TO_TICKS(1000)) {
                 g_in_menu_mode = true;
                 g_short_press_count = 0;
                 ESP_LOGI("BTN", "Menu Mode Active");
-                run_flash_animation(0xFFFFFF);
+                run_flash_animation(0xFF0000);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                run_flash_animation(0x000000);
+                vTaskDelay(pdMS_TO_TICKS(100));
             }
         } else {
             // 2. Detect Short Press on Release
@@ -476,7 +617,32 @@ void pov_render_task(void *pvParameters) {
 
         //button end
 
-// --- B. STATE SWITCHING ---
+        // --- B. STATE SWITCHING ---
+if ((xTaskGetTickCount() - g_last_battery_check) > pdMS_TO_TICKS(10000)) {    g_battery_voltage = read_battery_voltage();
+ 
+    
+
+    if (g_battery_voltage < 3.45f) {
+       while (1) {
+        g_emergency_mode = true;
+        led_task_running = false; // Stop normal patterns
+        show_sos_signal();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+	     }
+    } 
+    
+        if (g_battery_voltage < 3.40f) {
+        led_task_running = false; // Stop normal patterns
+        show_sos_signal();
+        gpio_set_level(REGULATOR_GPIO, 0);
+		esp_deep_sleep_enable_gpio_wakeup(1ULL << BUTTON_GPIO, ESP_GPIO_WAKEUP_GPIO_LOW);
+		esp_deep_sleep_start();	     
+    } 
+    g_last_battery_check = xTaskGetTickCount();
+} 
+        
+        
+        
 if (current_mode == MODE_STREAMING) {
     // Wait for the timer to tell us it's time for the next frame
     // We wait up to 100ms, but the timer will usually wake us much faster
@@ -493,24 +659,31 @@ if (current_mode == MODE_STREAMING) {
     continue; 
 }
         
+// --- Handle Animations if no file is loaded, or a specific animation is selected ---
+if (f == NULL) {
+    switch (g_current_animation) {
+        case 0: // Default Rainbow Pattern
+            default_rainbow_pattern();
+            break;
+        case 1: // Fire Animation
+            fire_animation(led_strip, g_brightness);
+            break;
+        case 2: // Ocean Waves Animation
+            ocean_waves_animation(led_strip, g_brightness);
+            break;
+        case 3: // Custom Animation (Matrix Rain)
+            custom_animation(led_strip, g_brightness);
+            break;
+        default:
+            default_rainbow_pattern(); // Fallback
+            break;
+    }
+    continue; // Continue to the next loop iteration after rendering an animation
+}
         
         //check battery
 
-if ((xTaskGetTickCount() - g_last_battery_check) > pdMS_TO_TICKS(10000)) {
-    g_battery_voltage = read_battery_voltage();
- 
-    
-/*
-    if (g_battery_voltage < 3.45f) {
-       while (1) {
-        g_emergency_mode = true;
-        led_task_running = false; // Stop normal patterns
-        show_sos_signal();
-        vTaskDelay(pdMS_TO_TICKS(5000));
-	     }
-    } */
-    g_last_battery_check = xTaskGetTickCount();
-} 
+
 
 
 
@@ -755,7 +928,8 @@ typedef enum {
     CC_START_STREAM = 21,
     CC_STOP_STREAM = 22,
     CC_GET_CONFIG = 23,
-    CC_STREAM_DATA = 24
+    CC_STREAM_DATA = 24,
+    CC_SET_ANIMATION = 25
 } poi_comm_code_t;
 
 // multi part upload
@@ -1041,6 +1215,24 @@ case CC_STREAM_DATA: {
 }
 break;
 
+case CC_SET_ANIMATION:
+    if (payload_len >= 1) {
+        g_current_animation = payload[0];
+        current_mode = MODE_PATTERN; // Switch to pattern mode to run procedural animations
+        
+        // Clear the LED strip immediately to show the change
+        if (led_strip) {
+            led_strip_clear(led_strip);
+            led_strip_refresh(led_strip);
+        }
+        ESP_LOGI("BLE", "Animation set to: %d", g_current_animation);
+        set_ble_reply(resp_success, sizeof(resp_success));
+    } else {
+        ESP_LOGE("BLE", "CC_SET_ANIMATION received without payload");
+        set_ble_reply(resp_error, sizeof(resp_error));
+    }
+    break;
+
             case CC_SET_SPEED_OPTION:
                 ESP_LOGI("BLE", "Speed option request");
                 ESP_LOG_BUFFER_HEX("BLE_SPEED_RAW", data, len);
@@ -1287,6 +1479,28 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    // Initialize REGULATOR_GPIO early
+    gpio_set_direction(REGULATOR_GPIO, GPIO_MODE_OUTPUT);
+
+    // Check if it's a deep sleep wakeup
+    esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
+    if (wakeup_cause == ESP_SLEEP_WAKEUP_GPIO) {
+        uint64_t wakeup_gpio_mask = esp_sleep_get_gpio_wakeup_status();
+        if (wakeup_gpio_mask & (1ULL << BUTTON_GPIO)) {
+            ESP_LOGI(TAG, "Woke up from deep sleep by GPIO %d (button)", BUTTON_GPIO);
+            // No need for rtc_gpio_deinit as esp_deep_sleep_enable_gpio_wakeup handles it.
+            // Re-enable normal GPIO pull-up/down if needed after wakeup for normal operation
+            gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+            gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ENABLE);
+        }
+        // Re-enable regulator after deep sleep wakeup
+        gpio_set_level(REGULATOR_GPIO, 1);
+    } else {
+        ESP_LOGI(TAG, "Not a deep sleep wakeup or unknown cause: %d", wakeup_cause);
+        // Ensure regulator is on for fresh boot
+        gpio_set_level(REGULATOR_GPIO, 1);
+    }
+
     //init fs
     init_littlefs();
 
@@ -1321,8 +1535,8 @@ void app_main(void) {
     // 3. Start the port (this triggers the stack)
 
     // 6. Hardware Init (Keep this AFTER BLE init to ensure heap availability)
-    gpio_set_direction(REGULATOR_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(REGULATOR_GPIO, 1);
+    // gpio_set_direction(REGULATOR_GPIO, GPIO_MODE_OUTPUT); // Redundant, initialized earlier
+    // gpio_set_level(REGULATOR_GPIO, 1); // Redundant, initialized earlier
 
     // init queue
     flash_queue = xQueueCreate(20, sizeof(flash_packet_t));
@@ -1338,20 +1552,19 @@ led_strip_config_t strip_config = {
     led_strip_rmt_config_t rmt_config = {
     .clk_src = RMT_CLK_SRC_DEFAULT,
     .resolution_hz = 10 * 1000 * 500, // 10MHz
-    .mem_block_symbols = 128,          // You already tried this, keep it
-    
+    .mem_block_symbols = 128,          
+
     };
 
-// Change RMT to SPI here:
+
+
 ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
 
-  
-    
 
     ESP_LOGI(TAG, "LED Strip Initialized.");
     // --- Button setup ---
     gpio_config_t btn_conf = {
-        .pin_bit_mask = (1ULL << BOOT_BUTTON_PIN),
+        .pin_bit_mask = (1ULL << BUTTON_GPIO),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .intr_type = GPIO_INTR_ANYEDGE,
@@ -1362,7 +1575,7 @@ ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip)
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
 
     // 2. Use the NEW function name:
-    gpio_isr_handler_add(BOOT_BUTTON_PIN, button_isr_handler, NULL);
+    gpio_isr_handler_add(BUTTON_GPIO, button_isr_handler, NULL);
     // --- Button setup end ---
 
 
